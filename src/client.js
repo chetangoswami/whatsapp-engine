@@ -170,12 +170,13 @@ async function run() {
                         printIncomingMessage(data.message);
                         await callHttpRpc(baseUrl, { action: 'ack_message', id: data.message.id });
                         if (!continuous) {
-                            process.exit(0);
+                            return;
                         }
                     }
                 } catch (err) {
                     console.error('Failed to poll WhatsApp HTTP Bridge:', err.message);
-                    process.exit(1);
+                    process.exitCode = 1;
+                    return;
                 }
             }
         }
@@ -189,7 +190,8 @@ async function run() {
 
             if (!to) {
                 console.error('Error: Missing recipient ChatID or Name.');
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
 
             const payload = {
@@ -212,13 +214,15 @@ async function run() {
                 const res = await callHttpRpc(baseUrl, payload);
                 if (!res.ok) {
                     console.error('Send error:', res.error);
-                    process.exit(1);
+                    process.exitCode = 1;
+                    return;
                 }
                 console.log(`Message sent to ${to} (via HTTPS Bridge)`);
-                process.exit(0);
+                return;
             } catch (err) {
                 console.error('Failed to send via WhatsApp HTTP Bridge:', err.message);
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
         }
 
@@ -226,10 +230,11 @@ async function run() {
             try {
                 const res = await callHttpRpc(baseUrl, { action: 'status', requestId: 'stat_' + Date.now() });
                 console.log(JSON.stringify({ ...res, bridgeUrl: baseUrl, transport: 'https' }, null, 2));
-                process.exit(0);
+                return;
             } catch (err) {
                 console.error('Bridge offline:', err.message);
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
         }
 
@@ -239,10 +244,11 @@ async function run() {
             try {
                 const res = await callHttpRpc(baseUrl, { action: 'fetch_history', query, limit, requestId: 'hist_' + Date.now() });
                 console.log(JSON.stringify(res, null, 2));
-                process.exit(0);
+                return;
             } catch (err) {
                 console.error('Failed to fetch history via Bridge:', err.message);
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
         }
 
@@ -251,10 +257,11 @@ async function run() {
             try {
                 const res = await callHttpRpc(baseUrl, { action: 'list_chats', groupsOnly: true, query, requestId: 'grp_' + Date.now() });
                 console.log(JSON.stringify(res, null, 2));
-                process.exit(0);
+                return;
             } catch (err) {
                 console.error('Failed to list groups via Bridge:', err.message);
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
         }
 
@@ -264,10 +271,11 @@ async function run() {
             try {
                 const res = await callHttpRpc(baseUrl, { action: 'ui_search_chat', query, targetTitle, requestId: 'ui_' + Date.now() });
                 console.log(JSON.stringify(res, null, 2));
-                process.exit(0);
+                return;
             } catch (err) {
                 console.error('Failed UI search via Bridge:', err.message);
-                process.exit(1);
+                process.exitCode = 1;
+                return;
             }
         }
         return;
