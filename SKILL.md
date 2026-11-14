@@ -10,7 +10,12 @@ description: >-
 
 # WhatsApp Listener & Engine Skill (`whatsapp-listener`)
 
-This skill connects Antigravity to the local **WhatsApp WebSocket Engine** (`C:\Users\cheta\Documents\antigravity\jarvis\whatsapp-engine`), enabling real-time read-only message listening, history retrieval, group discovery, attachment downloading, and user-authorized outbound messaging.
+This skill connects Antigravity to the **WhatsApp WebSocket Engine** (`whatsapp-engine`), enabling real-time read-only message listening, history retrieval, group discovery, attachment downloading, and user-authorized outbound messaging.
+
+> **Engine Path Resolution (`<ENGINE_DIR>`):**
+> - **Local Windows Machine:** `C:\Users\cheta\Documents\antigravity\jarvis\whatsapp-engine`
+> - **Linux / macOS / Cloned Workspace:** Use the cloned `whatsapp-engine` directory path. Set `PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome` (or `/usr/bin/chromium`) if using system Chrome/Chromium.
+> - **Cloud Sandbox Caveat:** WhatsApp Web requires direct outbound WebSockets (`wss://web.whatsapp.com/ws/chat`). Sandboxed Cloud VMs whose proxies block external `wss://` upgrades cannot generate a QR code or link a device directly; run `engine.js` on the local host machine instead.
 
 ---
 

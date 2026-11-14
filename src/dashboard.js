@@ -154,6 +154,7 @@ app.get('/', (req, res) => {
     <script>
         lucide.createIcons();
 
+        const MAX_DOM_ROWS = 500;
         const seenSignatures = new Set();
         let totalMsgCount = 0;
         let currentFilter = 'all';
@@ -180,12 +181,15 @@ app.get('/', (req, res) => {
             }
         });
 
-        // Unified deduplication key shared by both WebSocket events and /api/chat-logs
-        function buildDedupKey(category, peer, text, timeIsoOrNow) {
+        // ID-first deduplication key shared by both WebSocket events and /api/chat-logs
+        function buildDedupKey(id, category, peer, text, timeIsoOrNow) {
+            if (id) {
+                return 'id:' + String(id);
+            }
             const normPeer = String(peer || '').trim().toLowerCase();
             const normText = String(text || '').trim();
             const ts = timeIsoOrNow ? new Date(timeIsoOrNow).getTime() : Date.now();
-            const bucket = Number.isFinite(ts) ? Math.floor(ts / 10000) : 0;
+            const bucket = Number.isFinite(ts) ? Math.floor(ts / 5000) : 0;
             return category + '|' + normPeer + '|' + normText + '|' + bucket;
         }
 
@@ -198,6 +202,9 @@ app.get('/', (req, res) => {
             row.textContent = '[' + time + '] ' + msg;
 
             term.appendChild(row);
+            while (term.children.length > MAX_DOM_ROWS) {
+                term.removeChild(term.firstElementChild);
+            }
             applyRowFilter(row);
 
             totalMsgCount++;
@@ -331,13 +338,13 @@ app.get('/', (req, res) => {
                         if (data.type === 'incoming_message') {
                             const sender = data.senderName || data.from;
                             const text = data.body || '(Media packet)';
-                            const sig = buildDedupKey('incoming', sender, text, new Date().toISOString());
+                            const sig = buildDedupKey(data.id, 'incoming', sender, text, new Date().toISOString());
                             if (seenSignatures.has(sig)) return;
                             seenSignatures.add(sig);
                             logTerminal('[INCOMING] From ' + sender + ': ' + text, 'log-info', 'incoming');
                         } else if (data.type === 'outgoing_message') {
                             const text = data.body || '';
-                            const sig = buildDedupKey('outgoing', data.to, text, new Date().toISOString());
+                            const sig = buildDedupKey(data.id, 'outgoing', data.to, text, new Date().toISOString());
                             if (seenSignatures.has(sig)) return;
                             seenSignatures.add(sig);
                             logTerminal('[OUTGOING] To ' + data.to + ': ' + text, 'log-success', 'outgoing');
@@ -373,7 +380,7 @@ app.get('/', (req, res) => {
 
                         const peer = log.from || log.to || '';
                         const displayText = text || '(Media / Sync packet)';
-                        const sig = buildDedupKey(log.type, peer, displayText, log.time);
+                        const sig = buildDedupKey(log.id, log.type, peer, displayText, log.time);
                         if (seenSignatures.has(sig)) return;
                         seenSignatures.add(sig);
 

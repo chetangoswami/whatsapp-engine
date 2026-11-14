@@ -10,12 +10,35 @@ const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
 
 const PORT = Number(process.env.WHATSAPP_ENGINE_PORT || 8080);
 const MEDIA_DIR = path.join(ROOT_DIR, 'media');
+const AUTH_DIR = path.join(ROOT_DIR, '.wwebjs_auth');
 const QR_HTML_PATH = path.join(ROOT_DIR, 'WhatsApp_QR.html');
 const QR_PNG_PATH = path.join(MEDIA_DIR, 'whatsapp_qr.png');
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 if (!fs.existsSync(MEDIA_DIR)) {
     fs.mkdirSync(MEDIA_DIR, { recursive: true });
 }
+
+// Clear stale Chromium SingletonLock files left behind by abrupt crashes
+function clearStaleBrowserLocks(dirPath) {
+    try {
+        if (!fs.existsSync(dirPath)) return;
+        const lockNames = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dirPath, entry.name);
+            if (lockNames.has(entry.name)) {
+                try {
+                    fs.unlinkSync(fullPath);
+                    console.log(`[Engine] Removed stale Chromium lock: ${fullPath}`);
+                } catch (e) {}
+            } else if (entry.isDirectory()) {
+                clearStaleBrowserLocks(fullPath);
+            }
+        }
+    } catch (e) {}
+}
+clearStaleBrowserLocks(AUTH_DIR);
 
 function crc32(buf) {
     let c = 0xffffffff;
@@ -77,13 +100,18 @@ function buildQrOutputs(text) {
     return { svg, png };
 }
 
+const puppeteerConfig = {
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+};
+if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+}
+
 const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: path.join(ROOT_DIR, '.wwebjs_auth') }),
+    authStrategy: new LocalAuth({ dataPath: AUTH_DIR }),
     authTimeoutMs: 0,
-    puppeteer: {
-        headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    }
+    puppeteer: puppeteerConfig
 });
 
 let isReady = false;
@@ -100,8 +128,9 @@ function matchesFilter(msg, meta) {
     }
     if (meta.chat) {
         const sender = (msg.senderName || '').toLowerCase();
+        const chatName = (msg.chatName || '').toLowerCase();
         const from = (msg.from || '').toLowerCase();
-        if (!sender.includes(meta.chat) && !from.includes(meta.chat)) {
+        if (!sender.includes(meta.chat) && !chatName.includes(meta.chat) && !from.includes(meta.chat)) {
             return false;
         }
     }
@@ -184,17 +213,26 @@ const engineStartTime = Math.floor(Date.now() / 1000) - 60;
 
 client.on('message_create', async (msg) => {
     if (msg.fromMe && msg.timestamp >= engineStartTime) {
+        if (msg.to === 'status@broadcast' || msg.from === 'status@broadcast') return;
         try {
-            const chat = await msg.getChat();
+            let targetName = msg.to;
+            try {
+                const chat = await msg.getChat();
+                if (chat && chat.name) targetName = chat.name;
+            } catch (err) {}
+
+            const msgId = msg.id?._serialized || msg.id?.$1 || `out_${Date.now()}`;
             appendToChatLogs({
+                id: msgId,
                 type: 'outgoing',
-                to: chat.name || msg.to,
+                to: targetName,
                 text: msg.body,
                 time: new Date().toISOString()
             });
             const payload = {
                 type: 'outgoing_message',
-                to: chat.name || msg.to,
+                id: msgId,
+                to: targetName,
                 body: msg.body
             };
             clients.forEach(ws => {
@@ -210,14 +248,41 @@ client.on('message', async (msg) => {
     if (msg.timestamp < engineStartTime) {
         return;
     }
+    // Ignore WhatsApp Status / Story broadcast updates
+    if (msg.from === 'status@broadcast' || msg.isStatus) {
+        return;
+    }
 
-    const contact = await msg.getContact();
-    const chat = await msg.getChat();
-    const name = contact.name || contact.pushname || contact.number;
+    // Safely resolve contact & chat (guards against WhatsApp @lid Evaluation failed crashes)
+    let name = msg._data?.notifyName || msg.author || msg.from;
+    let chatName = name;
+    let isGroup = String(msg.from || '').endsWith('@g.us');
+
+    try {
+        const contact = await msg.getContact();
+        if (contact) {
+            name = contact.name || contact.pushname || contact.number || name;
+        }
+    } catch (err) {
+        console.warn(`[Engine] Unresolvable @lid contact for ${msg.from}, using fallback name.`);
+    }
+
+    try {
+        const chat = await msg.getChat();
+        if (chat) {
+            chatName = chat.name || name;
+            isGroup = !!chat.isGroup;
+        }
+    } catch (err) {
+        console.warn(`[Engine] getChat() fallback for ${msg.from}:`, err.message);
+    }
 
     console.log(`[Engine] Received message from ${name}: ${msg.body}`);
 
+    const msgId = msg.id?._serialized || msg.id?.$1 || `msg_${Date.now()}`;
+
     appendToChatLogs({
+        id: msgId,
         type: 'incoming',
         from: name || msg.from,
         text: msg.body,
@@ -242,18 +307,25 @@ client.on('message', async (msg) => {
 
     const payload = {
         type: 'incoming_message',
-        id: msg.id._serialized || msg.id.$1 || `msg_${Date.now()}`,
+        id: msgId,
         from: msg.from,
         senderName: name,
-        chatName: chat.name || name,
+        chatName,
         body: msg.body || '',
-        isGroup: chat.isGroup,
+        isGroup,
         timestamp: msg.timestamp,
         media: mediaData
     };
 
-    // Always broadcast to passive monitors (e.g. dashboard)
-    let deliveredToActiveListener = false;
+    // Always enqueue into ACK-verified buffer first; only removed when ack_message arrives
+    if (!messageQueue.some(m => m.id === payload.id)) {
+        messageQueue.push(payload);
+        if (messageQueue.length > MAX_QUEUE_SIZE) {
+            messageQueue.shift();
+        }
+    }
+
+    // Broadcast to monitors and matching listeners
     clients.forEach(ws => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const role = ws.clientMeta?.role || 'legacy';
@@ -262,28 +334,25 @@ client.on('message', async (msg) => {
         } else if (role === 'listener') {
             if (matchesFilter(payload, ws.clientMeta)) {
                 ws.send(JSON.stringify(payload));
-                deliveredToActiveListener = true;
             }
         } else {
             ws.send(JSON.stringify(payload));
-            deliveredToActiveListener = true;
         }
     });
-
-    if (!deliveredToActiveListener) {
-        messageQueue.push(payload);
-        if (messageQueue.length > MAX_QUEUE_SIZE) {
-            messageQueue.shift();
-        }
-    }
 });
 
 wss.on('connection', (ws) => {
     console.log('[Engine] New WebSocket client connected.');
+    ws.isAlive = true;
     ws.clientMeta = { role: 'legacy', keyword: null, chat: null };
     clients.add(ws);
 
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
     ws.on('message', async (data) => {
+        ws.isAlive = true;
         try {
             const parsed = JSON.parse(data);
 
@@ -593,6 +662,37 @@ wss.on('connection', (ws) => {
         clients.delete(ws);
     });
 });
+
+// RFC 6455 Ping/Pong heartbeat to evict dead/zombie sockets
+const heartbeatTimer = setInterval(() => {
+    clients.forEach(ws => {
+        if (ws.isAlive === false) {
+            clients.delete(ws);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        try {
+            ws.ping();
+        } catch (e) {}
+    });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on('close', () => {
+    clearInterval(heartbeatTimer);
+});
+
+async function gracefulShutdown(signal) {
+    console.log(`[Engine] Received ${signal}. Shutting down gracefully...`);
+    clearInterval(heartbeatTimer);
+    try {
+        wss.close();
+        await client.destroy();
+    } catch (e) {}
+    process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 console.log(`[Engine] WebSocket Server started on ws://localhost:${PORT}`);
 client.initialize();

@@ -29,14 +29,20 @@ function appendToChatLogs(entry) {
             time: entry.time || now
         };
 
-        // Deduplicate identical messages logged within 3 seconds
+        // 1. Exact ID deduplication if message ID is present
+        if (record.id && logs.some(l => l.id === record.id)) {
+            return;
+        }
+
+        // 2. Fallback deduplication for entries without ID within 1.5s
         const last = logs[logs.length - 1];
         if (
+            !record.id &&
             last &&
             last.type === record.type &&
             (last.from || last.to) === (record.from || record.to) &&
             last.text === record.text &&
-            Math.abs(new Date(record.time).getTime() - new Date(last.time).getTime()) < 3000
+            Math.abs(new Date(record.time).getTime() - new Date(last.time).getTime()) < 1500
         ) {
             return;
         }
