@@ -514,8 +514,88 @@ async function executeAction(parsed) {
                 }
             }
             if (msg && msg.hasMedia) {
-                const media = await msg.downloadMedia();
-                return { type: 'media_response', messageId: parsed.messageId, media };
+                let media = null;
+                try {
+                    media = await msg.downloadMedia();
+                } catch (dlErr) {
+                    console.warn(`[Engine] Primary msg.downloadMedia() failed (${dlErr.message}), attempting pupPage mediaData blob fallback...`);
+                }
+                if (!media && client.pupPage) {
+                    media = await client.pupPage.evaluate(async (msgId) => {
+                        const m =
+                            window.require('WAWebCollections').Msg.get(msgId) ||
+                            (await window.require('WAWebCollections').Msg.getMessagesById([msgId]))?.messages?.[0];
+                        if (!m) return null;
+
+                        try {
+                            if (!m.mediaData || m.mediaData.mediaStage !== 'RESOLVED') {
+                                await m.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 });
+                            }
+                        } catch (e) {}
+
+                        // Fallback 1: Read directly from WhatsApp Web's resolved OpaqueData (mediaBlob)
+                        const mediaBlob = m.mediaData && m.mediaData.mediaBlob;
+                        if (mediaBlob) {
+                            const blob = typeof mediaBlob.forceToBlob === 'function'
+                                ? mediaBlob.forceToBlob()
+                                : (mediaBlob._blob || (typeof mediaBlob.url === 'function' ? await fetch(mediaBlob.url()).then(r => r.blob()) : null));
+                            if (blob) {
+                                const buf = await blob.arrayBuffer();
+                                const data = await window.WWebJS.arrayBufferToBase64Async(buf);
+                                return {
+                                    data,
+                                    mimetype: m.mimetype || blob.type || 'image/jpeg',
+                                    filename: m.filename || null,
+                                    filesize: m.size || blob.size || null
+                                };
+                            }
+                        }
+
+                        // Fallback 2: Try downloadAndDecrypt / downloadAndMaybeDecrypt with full mock QPL
+                        try {
+                            const dlMgr = window.require('WAWebDownloadManager').downloadManager;
+                            const mockQpl = new Proxy({}, {
+                                get: (target, prop) => () => mockQpl
+                            });
+                            const fn = dlMgr.downloadAndMaybeDecrypt || dlMgr.downloadAndDecrypt;
+                            if (fn) {
+                                const decryptedMedia = await fn.call(dlMgr, {
+                                    directPath: m.directPath,
+                                    encFilehash: m.encFilehash,
+                                    filehash: m.filehash,
+                                    mediaKey: m.mediaKey,
+                                    mediaKeyTimestamp: m.mediaKeyTimestamp,
+                                    type: m.type,
+                                    signal: new AbortController().signal,
+                                    downloadQpl: mockQpl
+                                });
+                                const data = await window.WWebJS.arrayBufferToBase64Async(decryptedMedia);
+                                return {
+                                    data,
+                                    mimetype: m.mimetype || 'image/jpeg',
+                                    filename: m.filename || null,
+                                    filesize: m.size || null
+                                };
+                            }
+                        } catch (e2) {}
+
+                        // Fallback 3: Base64 preview thumbnail from msg.body if full blob unavailable
+                        if (m.type === 'image' && m.body && m.body.length > 100) {
+                            return {
+                                data: m.body,
+                                mimetype: m.mimetype || 'image/jpeg',
+                                filename: m.filename || 'thumbnail.jpg',
+                                filesize: m.body.length
+                            };
+                        }
+                        return null;
+                    }, parsed.messageId);
+                }
+                if (media && media.data) {
+                    return { type: 'media_response', messageId: parsed.messageId, media };
+                } else {
+                    return { type: 'media_response', messageId: parsed.messageId, error: 'Media could not be decrypted or resolved' };
+                }
             } else {
                 return { type: 'media_response', messageId: parsed.messageId, error: 'Media not found on message' };
             }
