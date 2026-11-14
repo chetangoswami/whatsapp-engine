@@ -8,6 +8,7 @@
     "engine": "node src/engine.js",
     "listen": "node src/client.js listen",
     "status": "node src/client.js status",
+    "bridge": "node scripts/start_cloud_bridge.js",
     "dashboard": "node src/dashboard.js",
     "assignments": "node scripts/fetch_assignments.js"
   },

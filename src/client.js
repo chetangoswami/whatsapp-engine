@@ -1,7 +1,8 @@
 const WebSocket = require('ws');
-const { appendToChatLogs } = require('./utils/logger');
+const fs = require('fs');
+const path = require('path');
+const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
 
-const WS_URL = process.env.WHATSAPP_ENGINE_WS || 'ws://localhost:8080';
 const command = process.argv[2];
 
 function getFlagValue(flag) {
@@ -12,225 +13,473 @@ function getFlagValue(flag) {
     return null;
 }
 
-if (command === 'listen') {
-    const keywordRaw = getFlagValue('--keyword');
-    const keyword = keywordRaw ? keywordRaw.toLowerCase() : null;
-    const chatRaw = getFlagValue('--chat');
-    const chat = chatRaw ? chatRaw.toLowerCase() : null;
-    const continuous = process.argv.includes('--continuous');
+const EXPLICIT_URL = getFlagValue('--url') || process.env.WHATSAPP_ENGINE_HTTP || process.env.WHATSAPP_ENGINE_WS || '';
+const BRIDGE_TOKEN = getFlagValue('--token') || process.env.WHATSAPP_BRIDGE_TOKEN || '';
+const BRIDGE_FILE = path.join(ROOT_DIR, '.bridge_url');
+const GITHUB_REPO_API = 'https://api.github.com/repos/chetangoswami/whatsapp-engine';
 
-    const ws = new WebSocket(WS_URL);
+function guessMimeType(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    const map = {
+        '.pdf': 'application/pdf',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.webp': 'image/webp',
+        '.gif': 'image/gif',
+        '.mp4': 'video/mp4',
+        '.mp3': 'audio/mpeg',
+        '.txt': 'text/plain',
+        '.json': 'application/json'
+    };
+    return map[ext] || 'application/octet-stream';
+}
 
-    ws.on('open', () => {
-        ws.send(JSON.stringify({
-            action: 'register_listener',
-            keyword,
-            chat
-        }));
-    });
+function buildAuthHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (BRIDGE_TOKEN) {
+        headers['Authorization'] = `Bearer ${BRIDGE_TOKEN}`;
+    }
+    return headers;
+}
 
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'incoming_message') {
-                const bodyText = payload.body || '';
-                if (keyword && !bodyText.toLowerCase().includes(keyword)) {
-                    return;
-                }
-                if (chat) {
-                    const sender = (payload.senderName || '').toLowerCase();
-                    const from = (payload.from || '').toLowerCase();
-                    const chatName = (payload.chatName || '').toLowerCase();
-                    if (!sender.includes(chat) && !from.includes(chat) && !chatName.includes(chat)) {
-                        return;
-                    }
-                }
-
-                console.log('\n[WHATSAPP MESSAGE RECEIVED]');
-                console.log(`From: ${payload.senderName}`);
-                if (payload.chatName && payload.chatName !== payload.senderName) {
-                    console.log(`Chat: ${payload.chatName}`);
-                }
-                console.log(`ChatID: ${payload.from}`);
-                console.log(`[ID: ${payload.id}]`);
-                if (payload.media) {
-                    console.log(`Media: ${payload.media.path} (${payload.media.mimetype})`);
-                }
-                console.log(`\n${bodyText}\n`);
-
-                ws.send(JSON.stringify({ action: 'ack_message', id: payload.id }));
-
-                if (!continuous) {
-                    setTimeout(() => {
-                        ws.close();
-                        process.exit(0);
-                    }, 100);
-                }
-            }
-        } catch (e) {
-            console.error('Parse error:', e.message);
+// Resolve HTTP Bridge URL from flag, env, .bridge_url file, or GitHub repo homepage metadata
+async function discoverHttpBridgeUrl() {
+    if (EXPLICIT_URL.startsWith('http://') || EXPLICIT_URL.startsWith('https://')) {
+        return EXPLICIT_URL.replace(/\/+$/, '');
+    }
+    if (fs.existsSync(BRIDGE_FILE)) {
+        const saved = fs.readFileSync(BRIDGE_FILE, 'utf8').trim();
+        if (saved.startsWith('http://') || saved.startsWith('https://')) {
+            return saved.replace(/\/+$/, '');
         }
-    });
+    }
+    try {
+        const res = await fetch(GITHUB_REPO_API, {
+            headers: { 'User-Agent': 'whatsapp-engine-client', 'Accept': 'application/vnd.github+json' }
+        });
+        if (res.ok) {
+            const repo = await res.json();
+            if (repo.homepage && (repo.homepage.startsWith('https://') || repo.homepage.startsWith('http://'))) {
+                return repo.homepage.replace(/\/+$/, '');
+            }
+        }
+    } catch (e) {}
+    return null;
+}
 
-    ws.on('error', (err) => {
-        console.error('Failed to connect to WhatsApp Engine. Is it running?', err.message);
-        process.exit(1);
-    });
-} else if (command === 'send') {
-    const to = process.argv[3];
-    const text = process.argv[4] || '';
-    const replyTo = getFlagValue('--replyTo');
-    const mediaPath = getFlagValue('--media');
-    const requestId = 'send_' + Date.now();
+// Check if local engine is reachable on localhost:8080
+async function isLocalEngineAlive() {
+    try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch('http://localhost:8080/api/health', { signal: controller.signal });
+        clearTimeout(timer);
+        return res.ok;
+    } catch (e) {
+        return false;
+    }
+}
 
-    if (!to) {
-        console.error('Error: Missing recipient ChatID or Name.');
+async function resolveTransport() {
+    if (EXPLICIT_URL.startsWith('http://') || EXPLICIT_URL.startsWith('https://')) {
+        return { mode: 'http', baseUrl: EXPLICIT_URL.replace(/\/+$/, '') };
+    }
+    if (EXPLICIT_URL.startsWith('ws://') || EXPLICIT_URL.startsWith('wss://')) {
+        return { mode: 'ws', wsUrl: EXPLICIT_URL };
+    }
+    if (await isLocalEngineAlive()) {
+        return { mode: 'ws', wsUrl: 'ws://localhost:8080' };
+    }
+    const bridgeUrl = await discoverHttpBridgeUrl();
+    if (bridgeUrl) {
+        return { mode: 'http', baseUrl: bridgeUrl };
+    }
+    return { mode: 'ws', wsUrl: 'ws://localhost:8080' };
+}
+
+async function callHttpRpc(baseUrl, payload) {
+    const res = await fetch(`${baseUrl}/api/rpc`, {
+        method: 'POST',
+        headers: buildAuthHeaders(),
+        body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status}: ${text}`);
+    }
+    return await res.json();
+}
+
+function printIncomingMessage(payload) {
+    const bodyText = payload.body || '';
+    console.log('\n[WHATSAPP MESSAGE RECEIVED]');
+    console.log(`From: ${payload.senderName}`);
+    if (payload.chatName && payload.chatName !== payload.senderName) {
+        console.log(`Chat: ${payload.chatName}`);
+    }
+    console.log(`ChatID: ${payload.from}`);
+    console.log(`[ID: ${payload.id}]`);
+    if (payload.media) {
+        console.log(`Media: ${payload.media.path} (${payload.media.mimetype})`);
+    }
+    console.log(`\n${bodyText}\n`);
+}
+
+async function run() {
+    if (!command || !['listen', 'send', 'status', 'history', 'groups', 'ui_search'].includes(command)) {
+        console.log('Usage:');
+        console.log('  node client.js status [--url "https://..."]');
+        console.log('  node client.js listen [--keyword "jarvis"] [--chat "Gamla"] [--continuous] [--url "https://..."]');
+        console.log('  node client.js send "<ChatID_or_Name>" "<Message>" [--replyTo "<MessageID>"] [--media "<AbsolutePath>"]');
+        console.log('  node client.js history "<ChatNameQuery>" [limit]');
+        console.log('  node client.js groups ["<Query>"]');
+        console.log('  node client.js ui_search "<Query>" ["<TargetTitle>"]');
         process.exit(1);
     }
 
-    const ws = new WebSocket(WS_URL);
-    ws.on('open', () => {
-        ws.send(JSON.stringify({
-            action: 'send_message',
-            requestId,
-            to,
-            text,
-            quotedMessageId: replyTo,
-            mediaPath
-        }));
+    const transport = await resolveTransport();
 
-        appendToChatLogs({ type: 'outgoing', to, text });
-    });
+    // =========================================================================
+    // HTTP REST / LONG-POLLING TRANSPORT (Cloud VM & Remote Tunnel Compatible)
+    // =========================================================================
+    if (transport.mode === 'http') {
+        const { baseUrl } = transport;
 
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'send_response' && payload.requestId === requestId) {
-                if (!payload.ok) {
-                    console.error('Send error:', payload.error);
-                    ws.close();
+        if (command === 'listen') {
+            const keywordRaw = getFlagValue('--keyword');
+            const keyword = keywordRaw ? keywordRaw.toLowerCase() : '';
+            const chatRaw = getFlagValue('--chat');
+            const chat = chatRaw ? chatRaw.toLowerCase() : '';
+            const continuous = process.argv.includes('--continuous');
+
+            while (true) {
+                try {
+                    const params = new URLSearchParams({ timeout: '25000' });
+                    if (keyword) params.set('keyword', keyword);
+                    if (chat) params.set('chat', chat);
+
+                    const res = await fetch(`${baseUrl}/api/poll?${params.toString()}`, {
+                        headers: buildAuthHeaders()
+                    });
+                    if (!res.ok) {
+                        throw new Error(`Bridge poll returned HTTP ${res.status}`);
+                    }
+                    const data = await res.json();
+                    if (data && data.message) {
+                        printIncomingMessage(data.message);
+                        await callHttpRpc(baseUrl, { action: 'ack_message', id: data.message.id });
+                        if (!continuous) {
+                            process.exit(0);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Failed to poll WhatsApp HTTP Bridge:', err.message);
                     process.exit(1);
                 }
-                console.log(`Message sent to ${to}`);
-                ws.close();
-                process.exit(0);
             }
-        } catch (e) {}
-    });
+        }
 
-    setTimeout(() => {
-        ws.close();
-        process.exit(0);
-    }, 5000);
+        if (command === 'send') {
+            const to = process.argv[3];
+            const text = process.argv[4] || '';
+            const replyTo = getFlagValue('--replyTo');
+            const mediaPath = getFlagValue('--media');
+            const requestId = 'send_' + Date.now();
 
-    ws.on('error', (err) => {
-        console.error('Failed to connect to WhatsApp Engine. Is it running?', err.message);
-        process.exit(1);
-    });
-} else if (command === 'status') {
-    const requestId = 'stat_' + Date.now();
-    const ws = new WebSocket(WS_URL);
-
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ action: 'status', requestId }));
-    });
-
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'status_response' && payload.requestId === requestId) {
-                console.log(JSON.stringify(payload, null, 2));
-                ws.close();
-                process.exit(0);
+            if (!to) {
+                console.error('Error: Missing recipient ChatID or Name.');
+                process.exit(1);
             }
-        } catch (e) {}
-    });
 
-    ws.on('error', (err) => {
-        console.error('Engine offline:', err.message);
-        process.exit(1);
-    });
-} else if (command === 'history') {
-    const query = process.argv[3] || '';
-    const limit = parseInt(process.argv[4] || '50', 10);
-    const requestId = 'hist_' + Date.now();
-    const ws = new WebSocket(WS_URL);
+            const payload = {
+                action: 'send_message',
+                requestId,
+                to,
+                text,
+                quotedMessageId: replyTo
+            };
 
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ action: 'fetch_history', query, limit, requestId }));
-    });
-
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'history_response' && payload.requestId === requestId) {
-                console.log(JSON.stringify(payload, null, 2));
-                ws.close();
-                process.exit(0);
+            if (mediaPath && fs.existsSync(mediaPath)) {
+                payload.mediaBase64 = fs.readFileSync(mediaPath).toString('base64');
+                payload.mediaMimetype = guessMimeType(mediaPath);
+                payload.mediaFilename = path.basename(mediaPath);
+            } else if (mediaPath) {
+                payload.mediaPath = mediaPath;
             }
-        } catch (e) {}
-    });
 
-    ws.on('error', (err) => {
-        console.error('Failed to connect to WhatsApp Engine:', err.message);
-        process.exit(1);
-    });
-} else if (command === 'groups') {
-    const query = process.argv[3] || '';
-    const requestId = 'grp_' + Date.now();
-    const ws = new WebSocket(WS_URL);
-
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ action: 'list_chats', groupsOnly: true, query, requestId }));
-    });
-
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'list_response' && payload.requestId === requestId) {
-                console.log(JSON.stringify(payload, null, 2));
-                ws.close();
+            try {
+                const res = await callHttpRpc(baseUrl, payload);
+                if (!res.ok) {
+                    console.error('Send error:', res.error);
+                    process.exit(1);
+                }
+                console.log(`Message sent to ${to} (via HTTPS Bridge)`);
                 process.exit(0);
+            } catch (err) {
+                console.error('Failed to send via WhatsApp HTTP Bridge:', err.message);
+                process.exit(1);
             }
-        } catch (e) {}
-    });
+        }
 
-    ws.on('error', (err) => {
-        console.error('Failed to connect to WhatsApp Engine:', err.message);
-        process.exit(1);
-    });
-} else if (command === 'ui_search') {
-    const query = process.argv[3] || 'Gamla';
-    const targetTitle = process.argv[4] || 'Gamla Discussions';
-    const requestId = 'ui_' + Date.now();
-    const ws = new WebSocket(WS_URL);
-
-    ws.on('open', () => {
-        ws.send(JSON.stringify({ action: 'ui_search_chat', query, targetTitle, requestId }));
-    });
-
-    ws.on('message', (data) => {
-        try {
-            const payload = JSON.parse(data);
-            if (payload.type === 'ui_search_response' && payload.requestId === requestId) {
-                console.log(JSON.stringify(payload, null, 2));
-                ws.close();
+        if (command === 'status') {
+            try {
+                const res = await callHttpRpc(baseUrl, { action: 'status', requestId: 'stat_' + Date.now() });
+                console.log(JSON.stringify({ ...res, bridgeUrl: baseUrl, transport: 'https' }, null, 2));
                 process.exit(0);
+            } catch (err) {
+                console.error('Bridge offline:', err.message);
+                process.exit(1);
             }
-        } catch (e) {}
-    });
+        }
 
-    ws.on('error', (err) => {
-        console.error('Failed to connect to WhatsApp Engine:', err.message);
-        process.exit(1);
-    });
-} else {
-    console.log('Usage:');
-    console.log('  node client.js status');
-    console.log('  node client.js listen [--keyword "jarvis"] [--chat "Gamla"] [--continuous]');
-    console.log('  node client.js send "<ChatID_or_Name>" "<Message>" [--replyTo "<MessageID>"] [--media "<AbsolutePath>"]');
-    console.log('  node client.js history "<ChatNameQuery>" [limit]');
-    console.log('  node client.js groups ["<Query>"]');
-    console.log('  node client.js ui_search "<Query>" ["<TargetTitle>"]');
-    process.exit(1);
+        if (command === 'history') {
+            const query = process.argv[3] || '';
+            const limit = parseInt(process.argv[4] || '50', 10);
+            try {
+                const res = await callHttpRpc(baseUrl, { action: 'fetch_history', query, limit, requestId: 'hist_' + Date.now() });
+                console.log(JSON.stringify(res, null, 2));
+                process.exit(0);
+            } catch (err) {
+                console.error('Failed to fetch history via Bridge:', err.message);
+                process.exit(1);
+            }
+        }
+
+        if (command === 'groups') {
+            const query = process.argv[3] || '';
+            try {
+                const res = await callHttpRpc(baseUrl, { action: 'list_chats', groupsOnly: true, query, requestId: 'grp_' + Date.now() });
+                console.log(JSON.stringify(res, null, 2));
+                process.exit(0);
+            } catch (err) {
+                console.error('Failed to list groups via Bridge:', err.message);
+                process.exit(1);
+            }
+        }
+
+        if (command === 'ui_search') {
+            const query = process.argv[3] || 'Gamla';
+            const targetTitle = process.argv[4] || 'Gamla Discussions';
+            try {
+                const res = await callHttpRpc(baseUrl, { action: 'ui_search_chat', query, targetTitle, requestId: 'ui_' + Date.now() });
+                console.log(JSON.stringify(res, null, 2));
+                process.exit(0);
+            } catch (err) {
+                console.error('Failed UI search via Bridge:', err.message);
+                process.exit(1);
+            }
+        }
+        return;
+    }
+
+    // =========================================================================
+    // WEBSOCKET TRANSPORT (Default Localhost Mode)
+    // =========================================================================
+    const WS_URL = transport.wsUrl;
+
+    if (command === 'listen') {
+        const keywordRaw = getFlagValue('--keyword');
+        const keyword = keywordRaw ? keywordRaw.toLowerCase() : null;
+        const chatRaw = getFlagValue('--chat');
+        const chat = chatRaw ? chatRaw.toLowerCase() : null;
+        const continuous = process.argv.includes('--continuous');
+
+        const ws = new WebSocket(WS_URL);
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                action: 'register_listener',
+                keyword,
+                chat
+            }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'incoming_message') {
+                    const bodyText = payload.body || '';
+                    if (keyword && !bodyText.toLowerCase().includes(keyword)) {
+                        return;
+                    }
+                    if (chat) {
+                        const sender = (payload.senderName || '').toLowerCase();
+                        const from = (payload.from || '').toLowerCase();
+                        const chatName = (payload.chatName || '').toLowerCase();
+                        if (!sender.includes(chat) && !from.includes(chat) && !chatName.includes(chat)) {
+                            return;
+                        }
+                    }
+
+                    printIncomingMessage(payload);
+                    ws.send(JSON.stringify({ action: 'ack_message', id: payload.id }));
+
+                    if (!continuous) {
+                        setTimeout(() => {
+                            ws.close();
+                            process.exit(0);
+                        }, 100);
+                    }
+                }
+            } catch (e) {
+                console.error('Parse error:', e.message);
+            }
+        });
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine. Is it running?', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'send') {
+        const to = process.argv[3];
+        const text = process.argv[4] || '';
+        const replyTo = getFlagValue('--replyTo');
+        const mediaPath = getFlagValue('--media');
+        const requestId = 'send_' + Date.now();
+
+        if (!to) {
+            console.error('Error: Missing recipient ChatID or Name.');
+            process.exit(1);
+        }
+
+        const ws = new WebSocket(WS_URL);
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                action: 'send_message',
+                requestId,
+                to,
+                text,
+                quotedMessageId: replyTo,
+                mediaPath
+            }));
+
+            appendToChatLogs({ type: 'outgoing', to, text });
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'send_response' && payload.requestId === requestId) {
+                    if (!payload.ok) {
+                        console.error('Send error:', payload.error);
+                        ws.close();
+                        process.exit(1);
+                    }
+                    console.log(`Message sent to ${to}`);
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        setTimeout(() => {
+            ws.close();
+            process.exit(0);
+        }, 5000);
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine. Is it running?', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'status') {
+        const requestId = 'stat_' + Date.now();
+        const ws = new WebSocket(WS_URL);
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ action: 'status', requestId }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'status_response' && payload.requestId === requestId) {
+                    console.log(JSON.stringify(payload, null, 2));
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        ws.on('error', (err) => {
+            console.error('Engine offline:', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'history') {
+        const query = process.argv[3] || '';
+        const limit = parseInt(process.argv[4] || '50', 10);
+        const requestId = 'hist_' + Date.now();
+        const ws = new WebSocket(WS_URL);
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ action: 'fetch_history', query, limit, requestId }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'history_response' && payload.requestId === requestId) {
+                    console.log(JSON.stringify(payload, null, 2));
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine:', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'groups') {
+        const query = process.argv[3] || '';
+        const requestId = 'grp_' + Date.now();
+        const ws = new WebSocket(WS_URL);
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ action: 'list_chats', groupsOnly: true, query, requestId }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'list_response' && payload.requestId === requestId) {
+                    console.log(JSON.stringify(payload, null, 2));
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine:', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'ui_search') {
+        const query = process.argv[3] || 'Gamla';
+        const targetTitle = process.argv[4] || 'Gamla Discussions';
+        const requestId = 'ui_' + Date.now();
+        const ws = new WebSocket(WS_URL);
+
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ action: 'ui_search_chat', query, targetTitle, requestId }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'ui_search_response' && payload.requestId === requestId) {
+                    console.log(JSON.stringify(payload, null, 2));
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine:', err.message);
+            process.exit(1);
+        });
+    }
 }
+
+run();

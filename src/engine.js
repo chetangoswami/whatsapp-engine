@@ -2,6 +2,8 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode-terminal/vendor/QRCode');
 const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel');
+const express = require('express');
+const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
@@ -9,6 +11,7 @@ const zlib = require('zlib');
 const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
 
 const PORT = Number(process.env.WHATSAPP_ENGINE_PORT || 8080);
+const BRIDGE_TOKEN = process.env.WHATSAPP_BRIDGE_TOKEN || '';
 const MEDIA_DIR = path.join(ROOT_DIR, 'media');
 const AUTH_DIR = path.join(ROOT_DIR, '.wwebjs_auth');
 const QR_HTML_PATH = path.join(ROOT_DIR, 'WhatsApp_QR.html');
@@ -19,7 +22,6 @@ if (!fs.existsSync(MEDIA_DIR)) {
     fs.mkdirSync(MEDIA_DIR, { recursive: true });
 }
 
-// Clear stale Chromium SingletonLock files left behind by abrupt crashes
 function clearStaleBrowserLocks(dirPath) {
     try {
         if (!fs.existsSync(dirPath)) return;
@@ -116,8 +118,8 @@ const client = new Client({
 
 let isReady = false;
 let qrPending = false;
-const wss = new WebSocket.Server({ port: PORT });
 const clients = new Set();
+const httpPollers = new Set();
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
 
@@ -144,10 +146,361 @@ function flushQueueForListener(ws) {
     for (const msg of messageQueue) {
         if (matchesFilter(msg, ws.clientMeta)) {
             ws.send(JSON.stringify(msg));
-            break; // Send one at a time; wait for ack_message before removing from queue
+            break;
         }
     }
 }
+
+// Shared action executor used by BOTH WebSocket and HTTP POST /api/rpc
+async function executeAction(parsed) {
+    if (parsed.action === 'ack_message') {
+        const idx = messageQueue.findIndex(m => m.id === parsed.id);
+        if (idx !== -1) {
+            messageQueue.splice(idx, 1);
+        }
+        return { type: 'ack_response', id: parsed.id, ok: true };
+    }
+
+    if (parsed.action === 'status') {
+        const activeListeners = [];
+        clients.forEach(c => {
+            if (c.readyState === WebSocket.OPEN && c.clientMeta?.role === 'listener') {
+                activeListeners.push({
+                    transport: 'ws',
+                    keyword: c.clientMeta.keyword || null,
+                    chat: c.clientMeta.chat || null
+                });
+            }
+        });
+        httpPollers.forEach(p => {
+            activeListeners.push({
+                transport: 'http_poll',
+                keyword: p.meta.keyword || null,
+                chat: p.meta.chat || null
+            });
+        });
+        return {
+            type: 'status_response',
+            requestId: parsed.requestId,
+            ready: isReady,
+            qrPending,
+            queuedMessages: messageQueue.length,
+            connectedClients: clients.size + httpPollers.size,
+            activeListeners
+        };
+    }
+
+    if (parsed.action === 'send_message') {
+        const { to, text, mediaPath, mediaBase64, mediaMimetype, mediaFilename, quotedMessageId, mentions, requestId } = parsed;
+        console.log(`[Engine] Requested to send message to "${to}"`);
+
+        const options = {};
+        if (quotedMessageId) options.quotedMessageId = quotedMessageId;
+        if (mentions) options.mentions = mentions;
+
+        let contentToSend = text;
+        if (mediaBase64 && mediaMimetype) {
+            contentToSend = new MessageMedia(mediaMimetype, mediaBase64, mediaFilename || 'attachment');
+            if (text) options.caption = text;
+        } else if (mediaPath) {
+            try {
+                contentToSend = MessageMedia.fromFilePath(mediaPath);
+                if (text) options.caption = text;
+            } catch (err) {
+                console.error(`[Engine] Failed to load media at ${mediaPath}:`, err);
+            }
+        }
+
+        if (!to) {
+            return { type: 'send_response', requestId, ok: false, error: 'Missing recipient' };
+        }
+
+        if (!isReady) {
+            return { type: 'send_response', requestId, ok: false, error: 'Engine not ready' };
+        }
+
+        if (to.includes('@c.us') || to.includes('@g.us') || to.includes('@lid')) {
+            try {
+                let chat = null;
+                try {
+                    chat = await client.getChatById(to);
+                } catch (err) {
+                    const chats = await client.getChats();
+                    chat = chats.find(c => (c.id._serialized || c.id.$1) === to || c.id.user === to);
+                }
+                if (chat) {
+                    await chat.sendMessage(contentToSend, options);
+                    console.log(`[Engine] Message sent successfully to ID ${to} via chat object!`);
+                    try { await chat.clearState(); } catch (err) {}
+                } else {
+                    await client.sendMessage(to, contentToSend, options);
+                    console.log(`[Engine] Message sent successfully to ID ${to} via client!`);
+                }
+                return { type: 'send_response', requestId, ok: true };
+            } catch (e) {
+                console.error(`[Engine] Error sending to ${to}:`, e);
+                return { type: 'send_response', requestId, ok: false, error: e.message };
+            }
+        }
+
+        const chats = await client.getChats();
+        const targetChat = chats.find(c =>
+            c.name === to ||
+            (c.name && c.name.toLowerCase() === to.toLowerCase()) ||
+            c.id.user === to ||
+            (c.id._serialized || c.id.$1) === to
+        );
+
+        if (targetChat) {
+            await targetChat.sendMessage(contentToSend, options);
+            console.log(`[Engine] Message sent successfully to ${to}!`);
+            return { type: 'send_response', requestId, ok: true };
+        } else {
+            return { type: 'send_response', requestId, ok: false, error: `Chat not found: ${to}` };
+        }
+    }
+
+    if (parsed.action === 'list_chats') {
+        if (!isReady) {
+            return { type: 'list_response', requestId: parsed.requestId, error: 'Not ready' };
+        }
+        const query = (parsed.query || '').toLowerCase();
+        const groupsOnly = !!parsed.groupsOnly;
+        const chats = await client.getChats();
+        const filtered = chats
+            .filter(c => (!groupsOnly || c.isGroup) && (!query || (c.name || '').toLowerCase().includes(query)))
+            .map(c => ({
+                id: c.id._serialized,
+                name: c.name,
+                isGroup: c.isGroup,
+                archived: c.archived,
+                timestamp: c.timestamp
+            }));
+        return { type: 'list_response', requestId: parsed.requestId, totalChats: chats.length, chats: filtered };
+    }
+
+    if (parsed.action === 'ui_search_chat') {
+        if (!isReady || !client.pupPage) {
+            return { type: 'ui_search_response', requestId: parsed.requestId, error: 'Not ready' };
+        }
+        const query = parsed.query || 'Gamla';
+        const targetTitle = parsed.targetTitle || 'Gamla Discussions';
+        const page = client.pupPage;
+
+        const storeMatches = await page.evaluate((q) => {
+            try {
+                const col = window.require('WAWebCollections').Chat;
+                const arr = col.getModelsArray ? col.getModelsArray() : [];
+                return arr
+                    .filter(c => {
+                        const hay = `${c.name || ''} ${c.formattedTitle || ''} ${c.contact?.name || ''} ${c.contact?.pushname || ''}`.toLowerCase();
+                        return hay.includes(q.toLowerCase());
+                    })
+                    .map(c => ({
+                        id: c.id?._serialized || String(c.id),
+                        name: c.name || c.formattedTitle,
+                        isGroup: !!c.isGroup,
+                        isParentGroup: !!c.groupMetadata?.isParentGroup,
+                        msgsCount: c.msgs?.length || 0
+                    }));
+            } catch (e) {
+                return [{ error: e.message }];
+            }
+        }, query);
+
+        let domResult = { clicked: null, visibleItems: [], messages: [], searchError: null };
+        try {
+            const searchSelector = 'div[contenteditable="true"][data-tab="3"], div[role="textbox"][aria-label*="Search"], div[contenteditable="true"]';
+            await page.waitForSelector(searchSelector, { timeout: 4000 });
+            const searchBox = await page.$(searchSelector);
+            await searchBox.click({ clickCount: 3 });
+            await page.keyboard.press('Backspace');
+            await page.keyboard.type(query, { delay: 30 });
+            await new Promise(r => setTimeout(r, 2000));
+
+            const items = await page.evaluate((target) => {
+                const spans = Array.from(document.querySelectorAll('#pane-side span[title]'));
+                const titles = [...new Set(spans.map(s => s.getAttribute('title')).filter(Boolean))];
+                const match = spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes(target.toLowerCase()))
+                    || spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes('discussion'))
+                    || spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes('gamla'));
+                if (match) {
+                    match.click();
+                    return { titles, clicked: match.getAttribute('title') };
+                }
+                return { titles, clicked: null };
+            }, targetTitle);
+
+            domResult.visibleItems = items.titles;
+            domResult.clicked = items.clicked;
+
+            if (items.clicked) {
+                await new Promise(r => setTimeout(r, 2500));
+                await page.evaluate(() => {
+                    const main = document.querySelector('#main div[data-testid="conversation-panel-messages"], #main div.copyable-area > div');
+                    if (main) main.scrollTop = Math.max(0, main.scrollTop - 1500);
+                });
+                await new Promise(r => setTimeout(r, 1500));
+
+                domResult.messages = await page.evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('#main div[data-id]'));
+                    return rows.slice(-60).map(row => {
+                        const pre = row.querySelector('[data-pre-plain-text]');
+                        const meta = pre ? pre.getAttribute('data-pre-plain-text') : '';
+                        const textEl = row.querySelector('span.selectable-text, span._ao3e');
+                        const text = textEl ? textEl.innerText : (row.innerText || '').trim();
+                        return {
+                            dataId: row.getAttribute('data-id'),
+                            meta,
+                            text
+                        };
+                    }).filter(m => m.text || m.meta);
+                });
+            }
+        } catch (e) {
+            domResult.searchError = e.message;
+        }
+
+        return { type: 'ui_search_response', requestId: parsed.requestId, storeMatches, domResult };
+    }
+
+    if (parsed.action === 'fetch_history') {
+        if (!isReady) {
+            return { type: 'history_response', requestId: parsed.requestId, error: 'WhatsApp client is not ready yet' };
+        }
+        const query = (parsed.query || '').toLowerCase();
+        const limit = parsed.limit || 50;
+        const chats = await client.getChats();
+        const matches = query
+            ? chats.filter(c => (c.name || '').toLowerCase().includes(query) || (c.id._serialized || '').toLowerCase() === query)
+            : chats.slice(0, 20);
+
+        const contactCache = new Map();
+        const results = [];
+        for (const chat of matches) {
+            const msgs = await chat.fetchMessages({ limit });
+            const formatted = [];
+            for (const m of msgs) {
+                const authorKey = m.author || m.from;
+                let sender = m.fromMe ? 'Me (Chetan)' : authorKey;
+                if (!m.fromMe && authorKey) {
+                    if (contactCache.has(authorKey)) {
+                        sender = contactCache.get(authorKey);
+                    } else {
+                        try {
+                            const c = await m.getContact();
+                            sender = c.name || c.pushname || c.number || authorKey;
+                            contactCache.set(authorKey, sender);
+                        } catch (err) {}
+                    }
+                }
+                formatted.push({
+                    id: m.id._serialized,
+                    fromMe: m.fromMe,
+                    sender,
+                    type: m.type,
+                    body: m.body,
+                    hasMedia: m.hasMedia,
+                    timestamp: m.timestamp,
+                    timeIST: new Date(m.timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+                });
+            }
+            results.push({
+                id: chat.id._serialized,
+                name: chat.name,
+                isGroup: chat.isGroup,
+                unreadCount: chat.unreadCount,
+                messages: formatted
+            });
+        }
+        return { type: 'history_response', requestId: parsed.requestId, chats: results };
+    }
+
+    if (parsed.action === 'fetch_media') {
+        if (!isReady) {
+            return { type: 'media_response', error: 'WhatsApp client is not ready yet' };
+        }
+        try {
+            const msg = await client.getMessageById(parsed.messageId);
+            if (msg && msg.hasMedia) {
+                const media = await msg.downloadMedia();
+                return { type: 'media_response', messageId: parsed.messageId, media };
+            } else {
+                return { type: 'media_response', messageId: parsed.messageId, error: 'Media not found on message' };
+            }
+        } catch (err) {
+            return { type: 'media_response', messageId: parsed.messageId, error: err.message };
+        }
+    }
+
+    return { type: 'error_response', error: `Unknown action: ${parsed.action}` };
+}
+
+// Express HTTP Server + WebSocket Server sharing Port 8080
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+
+// Optional Bearer token authentication middleware for HTTP Bridge endpoints
+function checkBridgeAuth(req, res, next) {
+    if (!BRIDGE_TOKEN) return next();
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : (req.query.token || '');
+    if (token !== BRIDGE_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized: invalid WHATSAPP_BRIDGE_TOKEN' });
+    }
+    next();
+}
+
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, ready: isReady, qrPending, queuedMessages: messageQueue.length });
+});
+
+// HTTP REST RPC Endpoint (Bypasses Cloud VM WebSocket Proxy Blocks)
+app.post('/api/rpc', checkBridgeAuth, async (req, res) => {
+    try {
+        const responsePayload = await executeAction(req.body || {});
+        res.json(responsePayload);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// HTTP Long-Polling Endpoint for `client.js listen` over pure HTTPS
+app.get('/api/poll', checkBridgeAuth, (req, res) => {
+    const keyword = req.query.keyword ? String(req.query.keyword).toLowerCase() : null;
+    const chat = req.query.chat ? String(req.query.chat).toLowerCase() : null;
+    const timeoutMs = Math.min(Number(req.query.timeout || 25000), 30000);
+    const meta = { role: 'listener', keyword, chat };
+
+    // 1. Check if a matching message is already waiting in messageQueue
+    for (const msg of messageQueue) {
+        if (matchesFilter(msg, meta)) {
+            return res.json({ ok: true, message: msg });
+        }
+    }
+
+    // 2. Otherwise hold the HTTP request open until a matching message arrives or timeout expires
+    const poller = {
+        meta,
+        res,
+        timer: setTimeout(() => {
+            httpPollers.delete(poller);
+            if (!res.headersSent) {
+                res.json({ ok: true, timeout: true, message: null });
+            }
+        }, timeoutMs)
+    };
+
+    httpPollers.add(poller);
+
+    req.on('close', () => {
+        clearTimeout(poller.timer);
+        httpPollers.delete(poller);
+    });
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 console.log('[Engine] Starting WhatsApp client...');
 
@@ -248,12 +601,10 @@ client.on('message', async (msg) => {
     if (msg.timestamp < engineStartTime) {
         return;
     }
-    // Ignore WhatsApp Status / Story broadcast updates
     if (msg.from === 'status@broadcast' || msg.isStatus) {
         return;
     }
 
-    // Safely resolve contact & chat (guards against WhatsApp @lid Evaluation failed crashes)
     let name = msg._data?.notifyName || msg.author || msg.from;
     let chatName = name;
     let isGroup = String(msg.from || '').endsWith('@g.us');
@@ -317,7 +668,6 @@ client.on('message', async (msg) => {
         media: mediaData
     };
 
-    // Always enqueue into ACK-verified buffer first; only removed when ack_message arrives
     if (!messageQueue.some(m => m.id === payload.id)) {
         messageQueue.push(payload);
         if (messageQueue.length > MAX_QUEUE_SIZE) {
@@ -325,7 +675,7 @@ client.on('message', async (msg) => {
         }
     }
 
-    // Broadcast to monitors and matching listeners
+    // 1. Broadcast to WebSocket monitors & matching listeners
     clients.forEach(ws => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const role = ws.clientMeta?.role || 'legacy';
@@ -339,6 +689,17 @@ client.on('message', async (msg) => {
             ws.send(JSON.stringify(payload));
         }
     });
+
+    // 2. Wake up any matching HTTP Long-Polling listeners (/api/poll)
+    for (const poller of Array.from(httpPollers)) {
+        if (matchesFilter(payload, poller.meta)) {
+            clearTimeout(poller.timer);
+            httpPollers.delete(poller);
+            if (!poller.res.headersSent) {
+                poller.res.json({ ok: true, message: payload });
+            }
+        }
+    }
 });
 
 wss.on('connection', (ws) => {
@@ -372,285 +733,27 @@ wss.on('connection', (ws) => {
             }
 
             if (parsed.action === 'ack_message') {
-                const idx = messageQueue.findIndex(m => m.id === parsed.id);
-                if (idx !== -1) {
-                    messageQueue.splice(idx, 1);
-                }
+                await executeAction(parsed);
                 return;
             }
 
-            if (parsed.action === 'status') {
-                const activeListeners = [];
-                clients.forEach(c => {
-                    if (c.readyState === WebSocket.OPEN && c.clientMeta?.role === 'listener') {
-                        activeListeners.push({
-                            keyword: c.clientMeta.keyword || null,
-                            chat: c.clientMeta.chat || null
-                        });
-                    }
-                });
-                ws.send(JSON.stringify({
-                    type: 'status_response',
-                    requestId: parsed.requestId,
-                    ready: isReady,
-                    qrPending,
-                    queuedMessages: messageQueue.length,
-                    connectedClients: clients.size,
-                    activeListeners
-                }));
-                return;
-            }
-
-            if (parsed.action === 'send_message') {
-                const { to, text, mediaPath, quotedMessageId, mentions, requestId } = parsed;
-                console.log(`[Engine] Requested to send message to "${to}"`);
-
-                const options = {};
-                if (quotedMessageId) options.quotedMessageId = quotedMessageId;
-                if (mentions) options.mentions = mentions;
-
-                let contentToSend = text;
-                if (mediaPath) {
-                    try {
-                        contentToSend = MessageMedia.fromFilePath(mediaPath);
-                        if (text) options.caption = text;
-                    } catch (err) {
-                        console.error(`[Engine] Failed to load media at ${mediaPath}:`, err);
-                    }
-                }
-
-                if (!to) {
-                    console.error(`[Engine] send_message action received with no 'to' field. Ignoring.`);
-                    if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: false, error: 'Missing recipient' }));
-                    return;
-                }
-
-                if (!isReady) {
-                    console.log(`[Engine] Cannot send message yet, WhatsApp client is not fully booted!`);
-                    if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: false, error: 'Engine not ready' }));
-                    return;
-                }
-
-                if (to.includes('@c.us') || to.includes('@g.us') || to.includes('@lid')) {
-                    try {
-                        let chat = null;
-                        try {
-                            chat = await client.getChatById(to);
-                        } catch (err) {
-                            const chats = await client.getChats();
-                            chat = chats.find(c => (c.id._serialized || c.id.$1) === to || c.id.user === to);
-                        }
-                        if (chat) {
-                            await chat.sendMessage(contentToSend, options);
-                            console.log(`[Engine] Message sent successfully to ID ${to} via chat object!`);
-                            try { await chat.clearState(); } catch (err) {}
-                        } else {
-                            await client.sendMessage(to, contentToSend, options);
-                            console.log(`[Engine] Message sent successfully to ID ${to} via client!`);
-                        }
-                        if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: true }));
-                    } catch (e) {
-                        console.error(`[Engine] Error sending to ${to}:`, e);
-                        if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: false, error: e.message }));
-                    }
-                    return;
-                }
-
-                const chats = await client.getChats();
-                const targetChat = chats.find(c =>
-                    c.name === to ||
-                    (c.name && c.name.toLowerCase() === to.toLowerCase()) ||
-                    c.id.user === to ||
-                    (c.id._serialized || c.id.$1) === to
-                );
-
-                if (targetChat) {
-                    await targetChat.sendMessage(contentToSend, options);
-                    console.log(`[Engine] Message sent successfully to ${to}!`);
-                    if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: true }));
-                } else {
-                    console.log(`[Engine] Could not find chat matching name: ${to}. Try using the exact ChatID.`);
-                    if (requestId) ws.send(JSON.stringify({ type: 'send_response', requestId, ok: false, error: `Chat not found: ${to}` }));
-                }
-            } else if (parsed.action === 'list_chats') {
-                if (!isReady) {
-                    ws.send(JSON.stringify({ type: 'list_response', requestId: parsed.requestId, error: 'Not ready' }));
-                    return;
-                }
-                const query = (parsed.query || '').toLowerCase();
-                const groupsOnly = !!parsed.groupsOnly;
-                const chats = await client.getChats();
-                const filtered = chats
-                    .filter(c => (!groupsOnly || c.isGroup) && (!query || (c.name || '').toLowerCase().includes(query)))
-                    .map(c => ({
-                        id: c.id._serialized,
-                        name: c.name,
-                        isGroup: c.isGroup,
-                        archived: c.archived,
-                        timestamp: c.timestamp
-                    }));
-                ws.send(JSON.stringify({ type: 'list_response', requestId: parsed.requestId, totalChats: chats.length, chats: filtered }));
-            } else if (parsed.action === 'ui_search_chat') {
-                if (!isReady || !client.pupPage) {
-                    ws.send(JSON.stringify({ type: 'ui_search_response', requestId: parsed.requestId, error: 'Not ready' }));
-                    return;
-                }
-                const query = parsed.query || 'Gamla';
-                const targetTitle = parsed.targetTitle || 'Gamla Discussions';
-                const page = client.pupPage;
-
-                const storeMatches = await page.evaluate((q) => {
-                    try {
-                        const col = window.require('WAWebCollections').Chat;
-                        const arr = col.getModelsArray ? col.getModelsArray() : [];
-                        return arr
-                            .filter(c => {
-                                const hay = `${c.name || ''} ${c.formattedTitle || ''} ${c.contact?.name || ''} ${c.contact?.pushname || ''}`.toLowerCase();
-                                return hay.includes(q.toLowerCase());
-                            })
-                            .map(c => ({
-                                id: c.id?._serialized || String(c.id),
-                                name: c.name || c.formattedTitle,
-                                isGroup: !!c.isGroup,
-                                isParentGroup: !!c.groupMetadata?.isParentGroup,
-                                msgsCount: c.msgs?.length || 0
-                            }));
-                    } catch (e) {
-                        return [{ error: e.message }];
-                    }
-                }, query);
-
-                let domResult = { clicked: null, visibleItems: [], messages: [], searchError: null };
-                try {
-                    const searchSelector = 'div[contenteditable="true"][data-tab="3"], div[role="textbox"][aria-label*="Search"], div[contenteditable="true"]';
-                    await page.waitForSelector(searchSelector, { timeout: 4000 });
-                    const searchBox = await page.$(searchSelector);
-                    await searchBox.click({ clickCount: 3 });
-                    await page.keyboard.press('Backspace');
-                    await page.keyboard.type(query, { delay: 30 });
-                    await new Promise(r => setTimeout(r, 2000));
-
-                    const items = await page.evaluate((target) => {
-                        const spans = Array.from(document.querySelectorAll('#pane-side span[title]'));
-                        const titles = [...new Set(spans.map(s => s.getAttribute('title')).filter(Boolean))];
-                        const match = spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes(target.toLowerCase()))
-                            || spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes('discussion'))
-                            || spans.find(s => (s.getAttribute('title') || '').toLowerCase().includes('gamla'));
-                        if (match) {
-                            match.click();
-                            return { titles, clicked: match.getAttribute('title') };
-                        }
-                        return { titles, clicked: null };
-                    }, targetTitle);
-
-                    domResult.visibleItems = items.titles;
-                    domResult.clicked = items.clicked;
-
-                    if (items.clicked) {
-                        await new Promise(r => setTimeout(r, 2500));
-                        await page.evaluate(() => {
-                            const main = document.querySelector('#main div[data-testid="conversation-panel-messages"], #main div.copyable-area > div');
-                            if (main) main.scrollTop = Math.max(0, main.scrollTop - 1500);
-                        });
-                        await new Promise(r => setTimeout(r, 1500));
-
-                        domResult.messages = await page.evaluate(() => {
-                            const rows = Array.from(document.querySelectorAll('#main div[data-id]'));
-                            return rows.slice(-60).map(row => {
-                                const pre = row.querySelector('[data-pre-plain-text]');
-                                const meta = pre ? pre.getAttribute('data-pre-plain-text') : '';
-                                const textEl = row.querySelector('span.selectable-text, span._ao3e');
-                                const text = textEl ? textEl.innerText : (row.innerText || '').trim();
-                                return {
-                                    dataId: row.getAttribute('data-id'),
-                                    meta,
-                                    text
-                                };
-                            }).filter(m => m.text || m.meta);
-                        });
-                    }
-                } catch (e) {
-                    domResult.searchError = e.message;
-                }
-
-                ws.send(JSON.stringify({ type: 'ui_search_response', requestId: parsed.requestId, storeMatches, domResult }));
-            } else if (parsed.action === 'fetch_history') {
-                if (!isReady) {
-                    ws.send(JSON.stringify({ type: 'history_response', requestId: parsed.requestId, error: 'WhatsApp client is not ready yet' }));
-                    return;
-                }
-                const query = (parsed.query || '').toLowerCase();
-                const limit = parsed.limit || 50;
-                const chats = await client.getChats();
-                const matches = query
-                    ? chats.filter(c => (c.name || '').toLowerCase().includes(query) || (c.id._serialized || '').toLowerCase() === query)
-                    : chats.slice(0, 20);
-
-                const contactCache = new Map();
-                const results = [];
-                for (const chat of matches) {
-                    const msgs = await chat.fetchMessages({ limit });
-                    const formatted = [];
-                    for (const m of msgs) {
-                        const authorKey = m.author || m.from;
-                        let sender = m.fromMe ? 'Me (Chetan)' : authorKey;
-                        if (!m.fromMe && authorKey) {
-                            if (contactCache.has(authorKey)) {
-                                sender = contactCache.get(authorKey);
-                            } else {
-                                try {
-                                    const c = await m.getContact();
-                                    sender = c.name || c.pushname || c.number || authorKey;
-                                    contactCache.set(authorKey, sender);
-                                } catch (err) {}
-                            }
-                        }
-                        formatted.push({
-                            id: m.id._serialized,
-                            fromMe: m.fromMe,
-                            sender,
-                            type: m.type,
-                            body: m.body,
-                            hasMedia: m.hasMedia,
-                            timestamp: m.timestamp,
-                            timeIST: new Date(m.timestamp * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-                        });
-                    }
-                    results.push({
-                        id: chat.id._serialized,
-                        name: chat.name,
-                        isGroup: chat.isGroup,
-                        unreadCount: chat.unreadCount,
-                        messages: formatted
-                    });
-                }
-                ws.send(JSON.stringify({ type: 'history_response', requestId: parsed.requestId, chats: results }));
-            } else if (parsed.action === 'fetch_media') {
-                if (!isReady) {
-                    ws.send(JSON.stringify({ type: 'media_response', error: 'WhatsApp client is not ready yet' }));
-                    return;
-                }
-                try {
-                    const msg = await client.getMessageById(parsed.messageId);
-                    if (msg && msg.hasMedia) {
-                        const media = await msg.downloadMedia();
-                        ws.send(JSON.stringify({ type: 'media_response', messageId: parsed.messageId, media }));
-                    } else {
-                        ws.send(JSON.stringify({ type: 'media_response', messageId: parsed.messageId, error: 'Media not found on message' }));
-                    }
-                } catch (err) {
-                    ws.send(JSON.stringify({ type: 'media_response', messageId: parsed.messageId, error: err.message }));
-                }
-            } else if (parsed.action === 'mcp_proxy_request') {
-                console.log(`[Engine] Routing MCP Proxy Request to Desktop Earpiece...`);
+            if (parsed.action === 'mcp_proxy_request') {
                 clients.forEach(c => {
                     if (c !== ws) c.send(JSON.stringify({ type: 'mcp_request', payload: parsed.payload }));
                 });
-            } else if (parsed.action === 'mcp_desktop_response') {
-                console.log(`[Engine] Routing MCP Desktop Response back to Proxy...`);
+                return;
+            }
+
+            if (parsed.action === 'mcp_desktop_response') {
                 clients.forEach(c => {
                     if (c !== ws) c.send(JSON.stringify({ type: 'mcp_response', payload: parsed.payload }));
                 });
+                return;
+            }
+
+            const result = await executeAction(parsed);
+            if (result && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(result));
             }
         } catch (e) {
             console.error('[Engine] WS Message Error:', e);
@@ -663,7 +766,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// RFC 6455 Ping/Pong heartbeat to evict dead/zombie sockets
 const heartbeatTimer = setInterval(() => {
     clients.forEach(ws => {
         if (ws.isAlive === false) {
@@ -685,6 +787,7 @@ async function gracefulShutdown(signal) {
     console.log(`[Engine] Received ${signal}. Shutting down gracefully...`);
     clearInterval(heartbeatTimer);
     try {
+        server.close();
         wss.close();
         await client.destroy();
     } catch (e) {}
@@ -694,5 +797,7 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-console.log(`[Engine] WebSocket Server started on ws://localhost:${PORT}`);
+server.listen(PORT, () => {
+    console.log(`[Engine] Unified WebSocket + HTTP Bridge Server listening on http://localhost:${PORT} (WS & /api/rpc, /api/poll)`);
+});
 client.initialize();
