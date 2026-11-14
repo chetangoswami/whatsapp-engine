@@ -13,11 +13,13 @@ When a WebSocket client connects to `ws://localhost:8080`, it can register its r
 {
   "action": "register_listener",
   "keyword": "jarvis",
-  "chat": "gamla"
+  "chat": "gamla",
+  "mentionedOnly": true
 }
 ```
 - `keyword` *(optional, string)*: Case-insensitive substring filter on `msg.body`.
 - `chat` *(optional, string)*: Case-insensitive substring filter matched against `senderName`, `chatName`, and `from` JID.
+- `mentionedOnly` *(optional, boolean)*: When `true`, only delivers messages where `msg.isMeMentioned === true` (or `agent_intercom` messages).
 - **Queue Behavior**: Upon registration, the engine flushes the oldest unacknowledged message from `messageQueue` that matches the listener's filter.
 
 ### Acknowledge Processed Message (`ack_message`)
@@ -94,10 +96,11 @@ When a WebSocket client connects to `ws://localhost:8080`, it can register its r
   {
     "action": "send_message",
     "requestId": "send_1",
-    "to": "919876543210@c.us",
-    "text": "Here is the updated document.",
+    "to": "120363431880017269@g.us",
+    "text": "Hey @919773530466, here is the updated document.",
     "quotedMessageId": "false_919876543210@c.us_3EB0...",
-    "mediaPath": "C:\\absolute\\path\\to\\file.pdf"
+    "mediaPath": "C:\\absolute\\path\\to\\file.pdf",
+    "mentions": ["9773530466"]
   }
   ```
 - **Response (`send_response`):**
@@ -105,9 +108,48 @@ When a WebSocket client connects to `ws://localhost:8080`, it can register its r
   {
     "type": "send_response",
     "requestId": "send_1",
-    "ok": true
+    "ok": true,
+    "id": "true_120363431880017269@g.us_3EB0...",
+    "mentions": ["919773530466@c.us"]
   }
   ```
+
+### `create_group`
+- **Request:**
+  ```json
+  {
+    "action": "create_group",
+    "requestId": "cgrp_1",
+    "title": "Jarvis Tag Test",
+    "participants": ["9773530466"]
+  }
+  ```
+- **Response (`create_group_response`):**
+  ```json
+  {
+    "type": "create_group_response",
+    "requestId": "cgrp_1",
+    "ok": true,
+    "title": "Jarvis Tag Test",
+    "gid": "120363431880017269@g.us",
+    "participants": {
+      "919773530466@c.us": { "statusCode": 200 }
+    }
+  }
+  ```
+
+### `agent_message` (Cloud ↔ Local Agent Intercom)
+- **Request:**
+  ```json
+  {
+    "action": "agent_message",
+    "requestId": "ag_1",
+    "fromAgent": "Cloud Agent",
+    "target": "local",
+    "text": "Downloaded all 12 full-res screenshots."
+  }
+  ```
+- **Response (`agent_message_response`):** `{ "type": "agent_message_response", "ok": true, "id": "agent_1763..." }`
 
 ### `fetch_history`
 - **Request:** `{ "action": "fetch_history", "query": "Gamla", "limit": 50, "requestId": "hist_1" }`

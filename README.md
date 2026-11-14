@@ -13,11 +13,11 @@ A persistent local **WhatsApp WebSocket Engine**, **CLI Earpiece Listener**, and
 
 ```mermaid
 flowchart LR
-    WA["WhatsApp Web\n(Puppeteer + LocalAuth)"] <--> ENG["src/engine.js\nWebSocket Server (:8080)\n+ ACK Message Queue"]
-    ENG <-->|"register_listener\n+ ack_message"| CLI["src/client.js\nAgent CLI Earpiece"]
-    ENG -->|"register_monitor\n(Read-Only Stream)"| DASH["src/dashboard.js\nLive Web UI (:3000)"]
+    WA["WhatsApp Web\n(Puppeteer + LocalAuth)"] <--> ENG["src/engine.js\nHTTP + WS Server (:8080)\n+ Live Dashboard UI\n+ ACK Message Queue"]
+    ENG <-->|"ws://localhost:8080\n(Local Mode)"| CLI["src/client.js\nAgent CLI Earpiece"]
+    ENG <-->|"Cloudflare Tunnel\n(/api/rpc & /api/poll)"| BRIDGE["Private Cloud Bridge\n(Bearer Token Auth)"]
+    BRIDGE <-->|"HTTPS + GitHub Auth"| CLOUD["Remote Cloud Agent\n(VM / Sandbox)"]
     ENG -->|"Atomic Write"| LOG["chat_logs.json\n(Deduplicated Log)"]
-    CLI <-->|"Wakeup & Commands"| AGY["AI Agent\n(whatsapp-listener Skill)"]
 ```
 
 ### Repository Structure
@@ -25,19 +25,21 @@ flowchart LR
 ```text
 whatsapp-engine/
 ├── src/
-│   ├── engine.js                              # Persistent WhatsApp client + WS server (ws://localhost:8080)
-│   ├── client.js                              # CLI Earpiece (listen, send, status, history, groups, ui_search)
-│   ├── dashboard.js                           # Real-time web monitor UI (http://localhost:3000)
+│   ├── engine.js                              # Persistent WhatsApp client + HTTP/WS server & Live Dashboard (:8080)
+│   ├── client.js                              # Dual-transport CLI Earpiece (Local WS + Remote HTTPS Cloud Bridge)
+│   ├── dashboard.js                           # Standalone web monitor UI
 │   └── utils/
+│       ├── auth.js                            # Private GitHub-backed Bearer token & tunnel discovery
 │       └── logger.js                          # Atomic, deduplicated JSON chat logger
 ├── scripts/
+│   ├── start_cloud_bridge.js                  # Cloudflare HTTPS tunnel daemon + private GitHub config publisher
 │   ├── fetch_assignments.js                   # Batch assignment & academic group scanner
-│   └── get_media.js                           # On-demand media attachment downloader by Message ID
+│   └── get_media.js                           # Full-res HKDF media attachment downloader by Message ID
 ├── skills/
 │   └── whatsapp-listener/
 │       ├── SKILL.md                           # Official Agent Skill instructions
 │       └── references/
-│           └── websocket-protocol.md          # Full WebSocket JSON schema & troubleshooting guide
+│           └── websocket-protocol.md          # Full WebSocket & HTTPS Bridge JSON schema reference
 ├── SKILL.md                                   # Root skill entrypoint for single-repo skill installers
 ├── engine.js                                  # Root shim -> src/engine.js
 ├── client.js                                  # Root shim -> src/client.js
@@ -51,14 +53,16 @@ whatsapp-engine/
 1. **ACK-Verified Message Queue (Zero Dropped Messages)**
    - Incoming messages that arrive while the AI agent is busy processing a turn are buffered in `engine.js` (up to 100 messages).
    - Messages are **only** removed from the queue when an active `listener` client sends an `ack_message` frame.
-   - Passive monitors (`dashboard.js`) and filtered listeners (`--keyword`, `--chat`) never drain unmatched messages from the queue.
-2. **Read-Only Safety Lock**
-   - Listening to messages never triggers automatic blue ticks (`sendSeen`), typing indicators, or unsolicited auto-replies. Outbound messages are strictly opt-in via `client.js send`.
-3. **Isolated Media & Session Storage**
-   - Incoming media attachments are automatically saved into the git-ignored `media/` folder and their paths are included in the `[WHATSAPP MESSAGE RECEIVED]` output block.
-   - Multi-Device authentication tokens persist across restarts inside `.wwebjs_auth/`.
-4. **Live Web Monitor (`http://localhost:3000`)**
-   - Dark-mode dashboard displaying connection health, queue protection status, and a real-time XSS-sanitized message stream.
+   - Passive monitors and filtered listeners (`--keyword`, `--chat`, `--mentioned`) never drain unmatched messages from the queue.
+2. **Private HTTPS Cloud Bridge & Agent Intercom**
+   - `scripts/start_cloud_bridge.js` exposes `localhost:8080` over a Cloudflare HTTPS tunnel protected by a 256-bit Bearer token stored exclusively in your private `<owner>/whatsapp-bridge-config` GitHub repository.
+   - Remote Cloud VMs automatically authenticate via `gh auth token` / `git credential fill` and communicate with the local host agent using `node client.js agent-send "local|cloud" "<Message>"`.
+3. **Native HKDF-SHA256 + AES-256-CBC Media Decryption**
+   - `fetch_media` (`scripts/get_media.js`) downloads encrypted `.enc` blobs directly from WhatsApp's MMS CDN and performs native RFC 5869 HKDF key expansion and AES-256-CBC decryption to recover full-resolution images and documents even when WhatsApp Web's internal `downloadMedia()` fails.
+4. **Group Creation & `@mention` Tagging**
+   - Create groups directly from the CLI (`create-group`) by preloading `WAWebNewGroupFlowLoadable` in headless mode, send clickable `@mentions` (`--mentions`), and filter incoming group listeners to wake up only when your number is tagged (`--mentioned`).
+5. **Read-Only Safety Lock & Live Monitor (`http://localhost:8080/`)**
+   - Listening never triggers automatic blue ticks (`sendSeen`) or auto-replies. Built-in dark-mode dashboard on `http://localhost:8080/` streams WhatsApp messages and Cloud ↔ Local Agent Intercom events in real time.
 
 ---
 
