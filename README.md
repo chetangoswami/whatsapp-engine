@@ -108,8 +108,11 @@ Copy-Item -Path ".\skills\whatsapp-listener" -Destination ".\.agents\skills\what
 | `listen` | Connects to the engine and waits for the next matching message, prints `[WHATSAPP MESSAGE RECEIVED]`, acknowledges receipt, and exits with `0`. | `node client.js listen` |
 | `listen --keyword` | Wakes up only when a message contains the specified keyword (case-insensitive). | `node client.js listen --keyword "jarvis"` |
 | `listen --chat` | Wakes up only for messages from a matching sender, group name, or ChatID. | `node client.js listen --chat "Gamla"` |
+| `listen --mentioned` | Wakes up only when your WhatsApp account is explicitly `@mentioned` in a group. | `node client.js listen --mentioned` |
 | `listen --continuous` | Keeps streaming matching messages without exiting after the first message. | `node client.js listen --continuous` |
-| `send` | Sends a text message, quoted reply (`--replyTo`), or attachment (`--media`). | `node client.js send "919876543210@c.us" "Hello!" --replyTo "<MsgID>" --media "C:/file.pdf"` |
+| `send` | Sends a text message, quoted reply (`--replyTo`), attachment (`--media`), or `@mentions` (`--mentions`). | `node client.js send "120363...@g.us" "Hi @919876543210" --mentions "9876543210"` |
+| `create-group` | Creates a new WhatsApp group with one or more phone numbers or JIDs. | `node client.js create-group "Project Sync" "9876543210,9123456789"` |
+| `agent-send` | Sends a direct intercom message between Local Agent and Cloud Agent (`local` or `cloud`). | `node client.js agent-send "cloud" "Ready to sync"` |
 | `history` | Fetches recent messages (with IST timestamps) from matching chats. | `node client.js history "Gamla" 50` |
 | `groups` | Lists all WhatsApp groups (optionally filtered by name substring). | `node client.js groups "CSE"` |
 | `ui_search` | Fallback Puppeteer DOM search for unindexed community/subgroup chats. | `node client.js ui_search "Gamla" "Gamla Discussions"` |

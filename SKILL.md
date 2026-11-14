@@ -60,6 +60,11 @@ When the user asks to start, activate, or run the WhatsApp listener/earpiece:
      ```bash
      node <ENGINE_DIR>/client.js listen --chat "Gamla"
      ```
+   - **Mention-Filtered Routing** (only wake up when someone `@mentions` your WhatsApp account in a group):
+     ```bash
+     node <ENGINE_DIR>/client.js listen --mentioned
+     ```
+     *(Can be combined with `--chat` or `--keyword`, e.g. `node <ENGINE_DIR>/client.js listen --chat "Gamla" --mentioned`)*
 2. Inform the user that the WhatsApp Earpiece is active and listening. Do **not** poll in a loop—stop calling tools and wait for the system notification when a message arrives.
 3. When the background task completes, read the task output containing the `[WHATSAPP MESSAGE RECEIVED]` block:
    - `From`: Sender's display name or number
@@ -95,12 +100,17 @@ Use these synchronous CLI commands (`WaitMsBeforeAsync: 8000`) when the user ask
 
 ---
 
-## 4. Sending WhatsApp Messages & Safety Rules
+## 4. Sending WhatsApp Messages, Mentions & Creating Groups
 
-- **Strict Safety Lock:** Only send WhatsApp messages when explicitly instructed by the user. Never send unsolicited or automated replies.
-- **Send Text, Quoted Reply, or Media Attachment:**
+- **Strict Safety Lock:** Only send WhatsApp messages or create groups when explicitly instructed by the user. Never send unsolicited or automated replies.
+- **Send Text, Quoted Reply, Media Attachment, or Group `@mentions`:**
   ```bash
-  node <ENGINE_DIR>/client.js send "<ChatID_or_ExactName>" "<MessageText>" [--replyTo "<MessageID>"] [--media "<AbsoluteFilePath>"]
+  node <ENGINE_DIR>/client.js send "<ChatID_or_ExactName>" "<MessageText>" [--replyTo "<MessageID>"] [--media "<AbsoluteFilePath>"] [--mentions "<Phone1,Phone2>"]
+  ```
+  - **Group Tagging (`--mentions`) Criteria:** To trigger a clickable `@mention` notification in a group, include `@<CountryCode+Phone>` (e.g., `@919773530466`) in `<MessageText>` AND pass `--mentions "9773530466"` (10-digit Indian numbers are automatically normalized to `91<number>@c.us`).
+- **Create a New WhatsApp Group:**
+  ```bash
+  node <ENGINE_DIR>/client.js create-group "<GroupTitle>" "<PhoneOrJID1,PhoneOrJID2,...>"
   ```
 - Prefer passing the exact `ChatID` (e.g., `919876543210@c.us` or `1203630...@g.us`) over display names to avoid ambiguity.
 
@@ -120,4 +130,4 @@ The Cloud Agent (on a remote VM) and the Local Agent (on the host PC) can commun
   ```
 - When awakened by an `[AGENT INTERCOM MESSAGE RECEIVED]` event, process the peer agent's request/update, reply via `agent-send` if needed, and immediately restart `node <ENGINE_DIR>/client.js listen` in the background.
 
-> For deep WebSocket & HTTPS Bridge JSON payload schemas, ACK queue internals, and troubleshooting steps, read [skills/whatsapp-listener/references/websocket-protocol.md](./skills/whatsapp-listener/references/websocket-protocol.md).
+> For deep WebSocket & HTTPS Bridge JSON payload schemas, ACK queue internals, and troubleshooting steps, read [references/websocket-protocol.md](./references/websocket-protocol.md).

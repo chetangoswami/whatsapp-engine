@@ -114,6 +114,12 @@ function printIncomingMessage(payload) {
         console.log(`Chat: ${payload.chatName}`);
     }
     console.log(`ChatID: ${payload.from}`);
+    if (payload.author && payload.author !== payload.from) {
+        console.log(`AuthorID: ${payload.author}`);
+    }
+    if (payload.mentionedIds && payload.mentionedIds.length > 0) {
+        console.log(`Mentions: ${payload.mentionedIds.join(', ')}${payload.isMeMentioned ? ' (Mentioned Me: YES)' : ''}`);
+    }
     console.log(`[ID: ${payload.id}]`);
     if (payload.media) {
         console.log(`Media: ${payload.media.path} (${payload.media.mimetype})`);
@@ -122,12 +128,13 @@ function printIncomingMessage(payload) {
 }
 
 async function run() {
-    if (!command || !['listen', 'send', 'agent-send', 'status', 'history', 'groups', 'ui_search'].includes(command)) {
+    if (!command || !['listen', 'send', 'create-group', 'agent-send', 'status', 'history', 'groups', 'ui_search'].includes(command)) {
         console.log('Usage:');
         console.log('  node client.js status [--url "https://..."]');
-        console.log('  node client.js listen [--keyword "jarvis"] [--chat "Gamla"] [--continuous] [--url "https://..."]');
+        console.log('  node client.js listen [--keyword "jarvis"] [--chat "Gamla"] [--mentioned] [--continuous] [--url "https://..."]');
         console.log('  node client.js agent-send "<local|cloud|all>" "<Message>"');
-        console.log('  node client.js send "<ChatID_or_Name>" "<Message>" [--replyTo "<MessageID>"] [--media "<AbsolutePath>"]');
+        console.log('  node client.js send "<ChatID_or_Name>" "<Message>" [--replyTo "<MessageID>"] [--media "<AbsolutePath>"] [--mentions "919773530466@c.us,..."]');
+        console.log('  node client.js create-group "<GroupTitle>" "<PhoneOrJID1,PhoneOrJID2,...>"');
         console.log('  node client.js history "<ChatNameQuery>" [limit]');
         console.log('  node client.js groups ["<Query>"]');
         console.log('  node client.js ui_search "<Query>" ["<TargetTitle>"]');
@@ -147,6 +154,7 @@ async function run() {
             const keyword = keywordRaw ? keywordRaw.toLowerCase() : '';
             const chatRaw = getFlagValue('--chat');
             const chat = chatRaw ? chatRaw.toLowerCase() : '';
+            const mentionedOnly = process.argv.includes('--mentioned');
             const continuous = process.argv.includes('--continuous');
 
             while (true) {
@@ -154,6 +162,7 @@ async function run() {
                     const params = new URLSearchParams({ timeout: '25000', agentRole: 'cloud' });
                     if (keyword) params.set('keyword', keyword);
                     if (chat) params.set('chat', chat);
+                    if (mentionedOnly) params.set('mentionedOnly', '1');
 
                     const res = await fetch(`${baseUrl}/api/poll?${params.toString()}`, {
                         headers: buildAuthHeaders()
@@ -222,11 +231,38 @@ async function run() {
             }
         }
 
+        if (command === 'create-group') {
+            const title = process.argv[3];
+            const participantsRaw = process.argv[4] || '';
+            const participants = participantsRaw.split(',').map(s => s.trim()).filter(Boolean);
+            if (!title || participants.length === 0) {
+                console.error('Error: Usage: node client.js create-group "<GroupTitle>" "<PhoneOrJID1,PhoneOrJID2,...>"');
+                process.exitCode = 1;
+                return;
+            }
+            try {
+                const res = await callHttpRpc(baseUrl, {
+                    action: 'create_group',
+                    requestId: 'cgrp_' + Date.now(),
+                    title,
+                    participants
+                });
+                console.log(JSON.stringify(res, null, 2));
+                return;
+            } catch (err) {
+                console.error('Failed to create group via Bridge:', err.message);
+                process.exitCode = 1;
+                return;
+            }
+        }
+
         if (command === 'send') {
             const to = process.argv[3];
             const text = process.argv[4] || '';
             const replyTo = getFlagValue('--replyTo');
             const mediaPath = getFlagValue('--media');
+            const mentionsRaw = getFlagValue('--mentions');
+            const mentions = mentionsRaw ? mentionsRaw.split(',').map(s => s.trim()).filter(Boolean) : undefined;
             const requestId = 'send_' + Date.now();
 
             if (!to) {
@@ -240,7 +276,8 @@ async function run() {
                 requestId,
                 to,
                 text,
-                quotedMessageId: replyTo
+                quotedMessageId: replyTo,
+                mentions
             };
 
             if (mediaPath && fs.existsSync(mediaPath)) {
@@ -332,6 +369,7 @@ async function run() {
         const keyword = keywordRaw ? keywordRaw.toLowerCase() : null;
         const chatRaw = getFlagValue('--chat');
         const chat = chatRaw ? chatRaw.toLowerCase() : null;
+        const mentionedOnly = process.argv.includes('--mentioned');
         const continuous = process.argv.includes('--continuous');
 
         const ws = new WebSocket(WS_URL);
@@ -341,7 +379,8 @@ async function run() {
                 action: 'register_listener',
                 agentRole: 'local',
                 keyword,
-                chat
+                chat,
+                mentionedOnly
             }));
         });
 
@@ -350,6 +389,9 @@ async function run() {
                 const payload = JSON.parse(data);
                 if (payload.type === 'incoming_message') {
                     if (payload.isAgentMessage && payload.toAgent && payload.toAgent !== 'all' && payload.toAgent !== 'local') {
+                        return;
+                    }
+                    if (mentionedOnly && !payload.isAgentMessage && !payload.isMeMentioned) {
                         return;
                     }
                     const bodyText = payload.body || '';
@@ -426,11 +468,54 @@ async function run() {
             console.error('Failed to connect to WhatsApp Engine:', err.message);
             process.exit(1);
         });
+    } else if (command === 'create-group') {
+        const title = process.argv[3];
+        const participantsRaw = process.argv[4] || '';
+        const participants = participantsRaw.split(',').map(s => s.trim()).filter(Boolean);
+        const requestId = 'cgrp_' + Date.now();
+
+        if (!title || participants.length === 0) {
+            console.error('Error: Usage: node client.js create-group "<GroupTitle>" "<PhoneOrJID1,PhoneOrJID2,...>"');
+            process.exit(1);
+        }
+
+        const ws = new WebSocket(WS_URL);
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                action: 'create_group',
+                requestId,
+                title,
+                participants
+            }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'create_group_response' && payload.requestId === requestId) {
+                    console.log(JSON.stringify(payload, null, 2));
+                    ws.close();
+                    process.exit(payload.ok ? 0 : 1);
+                }
+            } catch (e) {}
+        });
+
+        setTimeout(() => {
+            ws.close();
+            process.exit(1);
+        }, 12000);
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine:', err.message);
+            process.exit(1);
+        });
     } else if (command === 'send') {
         const to = process.argv[3];
         const text = process.argv[4] || '';
         const replyTo = getFlagValue('--replyTo');
         const mediaPath = getFlagValue('--media');
+        const mentionsRaw = getFlagValue('--mentions');
+        const mentions = mentionsRaw ? mentionsRaw.split(',').map(s => s.trim()).filter(Boolean) : undefined;
         const requestId = 'send_' + Date.now();
 
         if (!to) {
@@ -446,7 +531,8 @@ async function run() {
                 to,
                 text,
                 quotedMessageId: replyTo,
-                mediaPath
+                mediaPath,
+                mentions
             }));
 
             appendToChatLogs({ type: 'outgoing', to, text });

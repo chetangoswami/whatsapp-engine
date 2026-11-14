@@ -143,6 +143,11 @@ function matchesFilter(msg, meta) {
             return false;
         }
     }
+    if (meta.mentionedOnly && !msg.isAgentMessage) {
+        if (!msg.isMeMentioned) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -261,13 +266,167 @@ async function executeAction(parsed) {
         };
     }
 
+    if (parsed.action === 'create_group') {
+        if (!isReady) {
+            return { type: 'create_group_response', requestId: parsed.requestId, ok: false, error: 'Engine not ready' };
+        }
+        const title = parsed.title || 'New Group';
+        const rawParticipants = Array.isArray(parsed.participants) ? parsed.participants : [parsed.participants].filter(Boolean);
+        const formattedParticipants = [];
+
+        for (let p of rawParticipants) {
+            let clean = String(p).trim();
+            if (!clean.includes('@')) {
+                clean = clean.replace(/\D/g, '');
+                if (clean.length === 10) clean = '91' + clean;
+                clean = clean + '@c.us';
+            }
+            try {
+                if (clean.endsWith('@c.us')) {
+                    const numId = await client.getNumberId(clean);
+                    if (numId && numId._serialized) {
+                        formattedParticipants.push(numId._serialized);
+                        continue;
+                    }
+                }
+            } catch (e) {}
+            formattedParticipants.push(clean);
+        }
+
+        try {
+            // Preload WAWebGroupCreateJob via WAWebNewGroupFlowLoadable.requireBundle() if WhatsApp Web lazy-loaded the New Group flow chunk
+            if (client.pupPage) {
+                try {
+                    await client.pupPage.evaluate(async () => {
+                        try {
+                            const loadable = window.require('WAWebNewGroupFlowLoadable');
+                            if (loadable && typeof loadable.requireBundle === 'function') {
+                                await loadable.requireBundle();
+                            }
+                            if (loadable && loadable.NewGroupFlowLoadable && typeof loadable.NewGroupFlowLoadable.preload === 'function') {
+                                await loadable.NewGroupFlowLoadable.preload();
+                            }
+                        } catch (e) {}
+                    });
+                } catch (e) {}
+            }
+
+            let res = await client.createGroup(title, formattedParticipants);
+            if (typeof res === 'string' && client.pupPage) {
+                res = await client.pupPage.evaluate(async (groupTitle, parts) => {
+                    try {
+                        const createWid = window.require('WAWebWidFactory').createWid;
+                        const queryWidExists = window.require('WAWebQueryExistsJob').queryWidExists;
+                        const apiContact = window.require('WAWebApiContact');
+                        const mod = window.require('WAWebGroupCreateJob');
+                        const createGroupFn = mod && mod.createGroup;
+
+                        if (!createGroupFn) {
+                            let loadableInfo = 'none';
+                            try {
+                                const ld = window.require('WAWebNewGroupFlowLoadable');
+                                if (ld) {
+                                    const keys = Object.keys(ld);
+                                    const details = keys.map(k => {
+                                        const v = ld[k];
+                                        const vKeys = v && typeof v === 'object' ? Object.keys(v).join(',') : '';
+                                        const vProto = v && Object.getPrototypeOf(v) ? Object.getOwnPropertyNames(Object.getPrototypeOf(v)).join(',') : '';
+                                        return `${k}(${typeof v})[${vKeys}|${vProto}]`;
+                                    });
+                                    loadableInfo = details.join(' ; ');
+                                }
+                            } catch (e) {
+                                loadableInfo = e.message;
+                            }
+                            return `CreateGroupDirectError: WAWebGroupCreateJob still not loaded | loadable=${loadableInfo}`;
+                        }
+
+                        const participantWids = [];
+                        for (const p of parts) {
+                            const wid = createWid(p);
+                            const exists = await queryWidExists(wid);
+                            const targetWid = exists?.wid || wid;
+                            let lidWid = null;
+                            try {
+                                if (apiContact && typeof apiContact.getCurrentLid === 'function') {
+                                    lidWid = apiContact.getCurrentLid(targetWid);
+                                }
+                            } catch (e) {}
+                            participantWids.push(lidWid ? { phoneNumber: targetWid, lid: lidWid } : { phoneNumber: targetWid });
+                        }
+                        try {
+                            const r1 = await createGroupFn(
+                                {
+                                    addressingModeOverride: 'lid',
+                                    memberAddMode: false,
+                                    membershipApprovalMode: false,
+                                    announce: false,
+                                    restrict: false,
+                                    ephemeralDuration: 0,
+                                    title: groupTitle
+                                },
+                                participantWids
+                            );
+                            return { title: groupTitle, gid: r1.wid, participants: r1.participants };
+                        } catch (err1) {
+                            const r2 = await createGroupFn(
+                                {
+                                    addressingModeOverride: 'pn',
+                                    memberAddMode: false,
+                                    membershipApprovalMode: false,
+                                    announce: false,
+                                    restrict: false,
+                                    ephemeralDuration: 0,
+                                    title: groupTitle
+                                },
+                                participantWids
+                            );
+                            return { title: groupTitle, gid: r2.wid, participants: r2.participants };
+                        }
+                    } catch (evalErr) {
+                        return `CreateGroupDirectError: ${evalErr.message || String(evalErr)}`;
+                    }
+                }, title, formattedParticipants);
+            }
+            if (typeof res === 'string') {
+                return { type: 'create_group_response', requestId: parsed.requestId, ok: false, error: res };
+            }
+            const groupId = res.gid?._serialized || res.gid?.$1 || String(res.gid || '');
+            return {
+                type: 'create_group_response',
+                requestId: parsed.requestId,
+                ok: true,
+                title: res.title || title,
+                groupId,
+                participants: res.participants || {}
+            };
+        } catch (err) {
+            return { type: 'create_group_response', requestId: parsed.requestId, ok: false, error: err.message };
+        }
+    }
+
     if (parsed.action === 'send_message') {
         const { to, text, mediaPath, mediaBase64, mediaMimetype, mediaFilename, quotedMessageId, mentions, requestId } = parsed;
         console.log(`[Engine] Requested to send message to "${to}"`);
 
         const options = {};
         if (quotedMessageId) options.quotedMessageId = quotedMessageId;
-        if (mentions) options.mentions = mentions;
+
+        if (mentions && Array.isArray(mentions) && mentions.length > 0) {
+            const resolvedMentions = [];
+            for (const m of mentions) {
+                let clean = String(m).trim();
+                if (!clean.includes('@')) {
+                    clean = clean.replace(/\D/g, '');
+                    if (clean.length === 10) clean = '91' + clean;
+                    clean = clean + '@c.us';
+                }
+                resolvedMentions.push(clean);
+            }
+            options.mentions = resolvedMentions;
+        } else if (mentions) {
+            options.mentions = mentions;
+        }
 
         let contentToSend = text;
         if (mediaBase64 && mediaMimetype) {
@@ -735,9 +894,10 @@ app.post('/api/rpc', checkBridgeAuth, async (req, res) => {
 app.get('/api/poll', checkBridgeAuth, (req, res) => {
     const keyword = req.query.keyword ? String(req.query.keyword).toLowerCase() : null;
     const chat = req.query.chat ? String(req.query.chat).toLowerCase() : null;
+    const mentionedOnly = req.query.mentionedOnly === 'true' || req.query.mentionedOnly === '1';
     const agentRole = req.query.agentRole ? String(req.query.agentRole).toLowerCase() : 'cloud';
     const timeoutMs = Math.min(Number(req.query.timeout || 25000), 30000);
-    const meta = { role: 'listener', keyword, chat, agentRole };
+    const meta = { role: 'listener', keyword, chat, mentionedOnly, agentRole };
 
     // 1. Check if a matching message is already waiting in messageQueue
     for (const msg of messageQueue) {
@@ -923,14 +1083,29 @@ client.on('message', async (msg) => {
         }
     }
 
+    const mentionedIds = Array.isArray(msg.mentionedIds)
+        ? msg.mentionedIds.map(id => (typeof id === 'object' && id !== null ? (id._serialized || id.$1 || String(id)) : String(id)))
+        : [];
+    const myWid = client.info?.wid?._serialized || '';
+    const myLid = client.info?.me?.lid || '';
+    const myUser = client.info?.wid?.user || '';
+    const isMeMentioned = mentionedIds.some(id =>
+        (myWid && id === myWid) ||
+        (myLid && id === myLid) ||
+        (myUser && id.includes(myUser))
+    );
+
     const payload = {
         type: 'incoming_message',
         id: msgId,
         from: msg.from,
+        author: msg.author || msg.from,
         senderName: name,
         chatName,
         body: msg.body || '',
         isGroup,
+        mentionedIds,
+        isMeMentioned,
         timestamp: msg.timestamp,
         media: mediaData
     };
@@ -989,7 +1164,8 @@ wss.on('connection', (ws) => {
                     role: 'listener',
                     agentRole: parsed.agentRole ? String(parsed.agentRole).toLowerCase() : 'local',
                     keyword: parsed.keyword ? String(parsed.keyword).toLowerCase() : null,
-                    chat: parsed.chat ? String(parsed.chat).toLowerCase() : null
+                    chat: parsed.chat ? String(parsed.chat).toLowerCase() : null,
+                    mentionedOnly: !!parsed.mentionedOnly
                 };
                 flushQueueForListener(ws);
                 return;
