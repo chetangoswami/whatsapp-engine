@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# WhatsApp Web LocalAuth session & Puppeteer cache (SENSITIVE - NEVER COMMIT)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Runtime logs, databases, QR codes & downloaded media
+chat_logs.json
+chat_logs.json.tmp
+database.json
+chats_overview.json
+assignment_messages.json
+WhatsApp_QR.html
+media/
+temp_*
+latest_*
+
+# Legacy archive & local scratch files
+_removed_legacy_bots/
+*.log
+.env
