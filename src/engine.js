@@ -492,7 +492,27 @@ async function executeAction(parsed) {
             return { type: 'media_response', error: 'WhatsApp client is not ready yet' };
         }
         try {
-            const msg = await client.getMessageById(parsed.messageId);
+            let msg = null;
+            try {
+                msg = await client.getMessageById(parsed.messageId);
+            } catch (e) {}
+            if (!msg && parsed.messageId) {
+                const parts = String(parsed.messageId).split('_');
+                const chatId = parts.length >= 3 ? parts[1] : null;
+                if (chatId) {
+                    let chat = null;
+                    try {
+                        chat = await client.getChatById(chatId);
+                    } catch (err) {
+                        const chats = await client.getChats();
+                        chat = chats.find(c => (c.id._serialized || c.id.$1) === chatId);
+                    }
+                    if (chat) {
+                        const msgs = await chat.fetchMessages({ limit: 80 });
+                        msg = msgs.find(m => m.id._serialized === parsed.messageId);
+                    }
+                }
+            }
             if (msg && msg.hasMedia) {
                 const media = await msg.downloadMedia();
                 return { type: 'media_response', messageId: parsed.messageId, media };
