@@ -1,3 +1,12 @@
+if ((process.env.HTTPS_PROXY || process.env.https_proxy) && !process.env.NODE_USE_ENV_PROXY) {
+    const { spawnSync } = require('child_process');
+    const res = spawnSync(process.execPath, process.argv.slice(1), {
+        stdio: 'inherit',
+        env: { ...process.env, NODE_USE_ENV_PROXY: '1' }
+    });
+    process.exit(res.status ?? 0);
+}
+
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
