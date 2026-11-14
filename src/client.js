@@ -1,7 +1,8 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
+const { appendToChatLogs } = require('./utils/logger');
+const { discoverPrivateBridgeConfig, getLocalGitHubToken } = require('./utils/auth');
 
 const command = process.argv[2];
 
@@ -14,9 +15,7 @@ function getFlagValue(flag) {
 }
 
 const EXPLICIT_URL = getFlagValue('--url') || process.env.WHATSAPP_ENGINE_HTTP || process.env.WHATSAPP_ENGINE_WS || '';
-const BRIDGE_TOKEN = getFlagValue('--token') || process.env.WHATSAPP_BRIDGE_TOKEN || '';
-const BRIDGE_FILE = path.join(ROOT_DIR, '.bridge_url');
-const GITHUB_REPO_API = 'https://api.github.com/repos/chetangoswami/whatsapp-engine';
+let activeBridgeToken = getFlagValue('--token') || process.env.WHATSAPP_BRIDGE_TOKEN || '';
 
 function guessMimeType(filePath) {
     const ext = path.extname(filePath).toLowerCase();
@@ -37,35 +36,11 @@ function guessMimeType(filePath) {
 
 function buildAuthHeaders() {
     const headers = { 'Content-Type': 'application/json' };
-    if (BRIDGE_TOKEN) {
-        headers['Authorization'] = `Bearer ${BRIDGE_TOKEN}`;
+    const token = activeBridgeToken || getLocalGitHubToken() || '';
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
     }
     return headers;
-}
-
-// Resolve HTTP Bridge URL from flag, env, .bridge_url file, or GitHub repo homepage metadata
-async function discoverHttpBridgeUrl() {
-    if (EXPLICIT_URL.startsWith('http://') || EXPLICIT_URL.startsWith('https://')) {
-        return EXPLICIT_URL.replace(/\/+$/, '');
-    }
-    if (fs.existsSync(BRIDGE_FILE)) {
-        const saved = fs.readFileSync(BRIDGE_FILE, 'utf8').trim();
-        if (saved.startsWith('http://') || saved.startsWith('https://')) {
-            return saved.replace(/\/+$/, '');
-        }
-    }
-    try {
-        const res = await fetch(GITHUB_REPO_API, {
-            headers: { 'User-Agent': 'whatsapp-engine-client', 'Accept': 'application/vnd.github+json' }
-        });
-        if (res.ok) {
-            const repo = await res.json();
-            if (repo.homepage && (repo.homepage.startsWith('https://') || repo.homepage.startsWith('http://'))) {
-                return repo.homepage.replace(/\/+$/, '');
-            }
-        }
-    } catch (e) {}
-    return null;
 }
 
 // Check if local engine is reachable on localhost:8080
@@ -91,9 +66,12 @@ async function resolveTransport() {
     if (await isLocalEngineAlive()) {
         return { mode: 'ws', wsUrl: 'ws://localhost:8080' };
     }
-    const bridgeUrl = await discoverHttpBridgeUrl();
-    if (bridgeUrl) {
-        return { mode: 'http', baseUrl: bridgeUrl };
+    const discovered = await discoverPrivateBridgeConfig();
+    if (discovered && discovered.bridgeUrl) {
+        if (!activeBridgeToken && discovered.bridgeToken) {
+            activeBridgeToken = discovered.bridgeToken;
+        }
+        return { mode: 'http', baseUrl: discovered.bridgeUrl };
     }
     return { mode: 'ws', wsUrl: 'ws://localhost:8080' };
 }

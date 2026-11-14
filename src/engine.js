@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
+const { readLocalBridgeAuth, fetchGitHubUser } = require('./utils/auth');
 
 const PORT = Number(process.env.WHATSAPP_ENGINE_PORT || 8080);
 const BRIDGE_TOKEN = process.env.WHATSAPP_BRIDGE_TOKEN || '';
@@ -440,19 +441,49 @@ async function executeAction(parsed) {
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
-// Optional Bearer token authentication middleware for HTTP Bridge endpoints
-function checkBridgeAuth(req, res, next) {
-    if (!BRIDGE_TOKEN) return next();
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : (req.query.token || '');
-    if (token !== BRIDGE_TOKEN) {
-        return res.status(401).json({ error: 'Unauthorized: invalid WHATSAPP_BRIDGE_TOKEN' });
+const verifiedGithubTokenCache = new Map();
+
+// Strict privacy authentication middleware for remote / tunneled requests
+async function checkBridgeAuth(req, res, next) {
+    const isProxied = !!(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
+    const remoteIp = req.socket?.remoteAddress || '';
+    const isLocalLoopback = !isProxied && (remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1');
+
+    if (isLocalLoopback && !BRIDGE_TOKEN) {
+        return next();
     }
-    next();
+
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!token) {
+        return res.status(401).json({ error: 'Unauthorized: Private WhatsApp Bridge requires Bearer token' });
+    }
+
+    const localAuth = readLocalBridgeAuth();
+    const expectedToken = BRIDGE_TOKEN || (localAuth && localAuth.bridgeToken);
+
+    if (expectedToken && token === expectedToken) {
+        return next();
+    }
+
+    // Also allow if the caller presents a valid GitHub token belonging to the bridge owner
+    const expectedOwner = localAuth && localAuth.owner;
+    if (expectedOwner) {
+        if (verifiedGithubTokenCache.get(token) === expectedOwner.toLowerCase()) {
+            return next();
+        }
+        const ghUser = await fetchGitHubUser(token);
+        if (ghUser && ghUser.login && ghUser.login.toLowerCase() === expectedOwner.toLowerCase()) {
+            verifiedGithubTokenCache.set(token, expectedOwner.toLowerCase());
+            return next();
+        }
+    }
+
+    return res.status(401).json({ error: 'Unauthorized: Invalid WhatsApp Bridge credentials' });
 }
 
 app.get('/api/health', (req, res) => {
-    res.json({ ok: true, ready: isReady, qrPending, queuedMessages: messageQueue.length });
+    res.json({ ok: true, ready: isReady, qrPending });
 });
 
 // HTTP REST RPC Endpoint (Bypasses Cloud VM WebSocket Proxy Blocks)

@@ -20,5 +20,6 @@ latest_*
 _removed_legacy_bots/
 bin/
 .bridge_url
+.bridge_auth.json
 *.log
 .env
