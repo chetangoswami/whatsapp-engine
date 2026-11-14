@@ -126,6 +126,12 @@ const MAX_QUEUE_SIZE = 100;
 
 function matchesFilter(msg, meta) {
     if (!meta) return true;
+    // Prevent local listener from stealing messages addressed strictly to cloud agent, and vice-versa
+    if (msg.isAgentMessage && msg.toAgent && msg.toAgent !== 'all' && meta.agentRole) {
+        if (msg.toAgent !== meta.agentRole) {
+            return false;
+        }
+    }
     if (meta.keyword && !(msg.body || '').toLowerCase().includes(meta.keyword)) {
         return false;
     }
@@ -160,6 +166,70 @@ async function executeAction(parsed) {
             messageQueue.splice(idx, 1);
         }
         return { type: 'ack_response', id: parsed.id, ok: true };
+    }
+
+    if (parsed.action === 'agent_message') {
+        const fromAgent = String(parsed.fromAgent || 'cloud').toLowerCase();
+        const toAgent = String(parsed.toAgent || 'local').toLowerCase();
+        const text = String(parsed.text || '');
+        const msgId = `agent_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+        console.log(`[Engine Intercom] ${fromAgent.toUpperCase()} AGENT -> ${toAgent.toUpperCase()} AGENT: ${text}`);
+
+        appendToChatLogs({
+            id: msgId,
+            type: 'agent',
+            from: `${fromAgent.toUpperCase()} AGENT`,
+            to: `${toAgent.toUpperCase()} AGENT`,
+            text,
+            time: new Date().toISOString()
+        });
+
+        const payload = {
+            type: 'incoming_message',
+            isAgentMessage: true,
+            id: msgId,
+            from: `agent:${fromAgent}@intercom`,
+            senderName: `${fromAgent.toUpperCase()} AGENT`,
+            chatName: `Agent Intercom (${fromAgent} -> ${toAgent})`,
+            fromAgent,
+            toAgent,
+            body: text,
+            isGroup: false,
+            timestamp: Math.floor(Date.now() / 1000),
+            media: null
+        };
+
+        messageQueue.push(payload);
+        if (messageQueue.length > MAX_QUEUE_SIZE) {
+            messageQueue.shift();
+        }
+
+        // 1. Broadcast to WebSocket monitors & matching local listeners
+        clients.forEach(ws => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            const role = ws.clientMeta?.role || 'legacy';
+            if (role === 'monitor') {
+                ws.send(JSON.stringify(payload));
+            } else if (role === 'listener') {
+                if (matchesFilter(payload, ws.clientMeta)) {
+                    ws.send(JSON.stringify(payload));
+                }
+            }
+        });
+
+        // 2. Wake up matching HTTP Long-Polling listeners (/api/poll)
+        for (const poller of Array.from(httpPollers)) {
+            if (matchesFilter(payload, poller.meta)) {
+                clearTimeout(poller.timer);
+                httpPollers.delete(poller);
+                if (!poller.res.headersSent) {
+                    poller.res.json({ ok: true, message: payload });
+                }
+            }
+        }
+
+        return { type: 'agent_response', requestId: parsed.requestId, id: msgId, ok: true };
     }
 
     if (parsed.action === 'status') {
@@ -534,8 +604,9 @@ app.post('/api/rpc', checkBridgeAuth, async (req, res) => {
 app.get('/api/poll', checkBridgeAuth, (req, res) => {
     const keyword = req.query.keyword ? String(req.query.keyword).toLowerCase() : null;
     const chat = req.query.chat ? String(req.query.chat).toLowerCase() : null;
+    const agentRole = req.query.agentRole ? String(req.query.agentRole).toLowerCase() : 'cloud';
     const timeoutMs = Math.min(Number(req.query.timeout || 25000), 30000);
-    const meta = { role: 'listener', keyword, chat };
+    const meta = { role: 'listener', keyword, chat, agentRole };
 
     // 1. Check if a matching message is already waiting in messageQueue
     for (const msg of messageQueue) {
@@ -785,6 +856,7 @@ wss.on('connection', (ws) => {
             if (parsed.action === 'register_listener') {
                 ws.clientMeta = {
                     role: 'listener',
+                    agentRole: parsed.agentRole ? String(parsed.agentRole).toLowerCase() : 'local',
                     keyword: parsed.keyword ? String(parsed.keyword).toLowerCase() : null,
                     chat: parsed.chat ? String(parsed.chat).toLowerCase() : null
                 };

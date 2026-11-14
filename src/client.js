@@ -100,6 +100,14 @@ async function callHttpRpc(baseUrl, payload) {
 
 function printIncomingMessage(payload) {
     const bodyText = payload.body || '';
+    if (payload.isAgentMessage) {
+        console.log('\n[AGENT INTERCOM MESSAGE RECEIVED]');
+        console.log(`From: ${payload.senderName} (${payload.from})`);
+        console.log(`To: ${payload.toAgent || 'all'}`);
+        console.log(`[ID: ${payload.id}]`);
+        console.log(`\n${bodyText}\n`);
+        return;
+    }
     console.log('\n[WHATSAPP MESSAGE RECEIVED]');
     console.log(`From: ${payload.senderName}`);
     if (payload.chatName && payload.chatName !== payload.senderName) {
@@ -114,10 +122,11 @@ function printIncomingMessage(payload) {
 }
 
 async function run() {
-    if (!command || !['listen', 'send', 'status', 'history', 'groups', 'ui_search'].includes(command)) {
+    if (!command || !['listen', 'send', 'agent-send', 'status', 'history', 'groups', 'ui_search'].includes(command)) {
         console.log('Usage:');
         console.log('  node client.js status [--url "https://..."]');
         console.log('  node client.js listen [--keyword "jarvis"] [--chat "Gamla"] [--continuous] [--url "https://..."]');
+        console.log('  node client.js agent-send "<local|cloud|all>" "<Message>"');
         console.log('  node client.js send "<ChatID_or_Name>" "<Message>" [--replyTo "<MessageID>"] [--media "<AbsolutePath>"]');
         console.log('  node client.js history "<ChatNameQuery>" [limit]');
         console.log('  node client.js groups ["<Query>"]');
@@ -142,7 +151,7 @@ async function run() {
 
             while (true) {
                 try {
-                    const params = new URLSearchParams({ timeout: '25000' });
+                    const params = new URLSearchParams({ timeout: '25000', agentRole: 'cloud' });
                     if (keyword) params.set('keyword', keyword);
                     if (chat) params.set('chat', chat);
 
@@ -184,6 +193,32 @@ async function run() {
                     process.exitCode = 1;
                     return;
                 }
+            }
+        }
+
+        if (command === 'agent-send') {
+            const toAgent = (process.argv[3] || 'local').toLowerCase();
+            const text = process.argv[4] || '';
+            const fromAgent = getFlagValue('--from') || 'cloud';
+            if (!text) {
+                console.error('Error: Missing message text for agent-send.');
+                process.exitCode = 1;
+                return;
+            }
+            try {
+                const res = await callHttpRpc(baseUrl, {
+                    action: 'agent_message',
+                    requestId: 'ag_' + Date.now(),
+                    fromAgent,
+                    toAgent,
+                    text
+                });
+                console.log(`Agent Intercom message delivered (${fromAgent} -> ${toAgent}) [ID: ${res.id}]`);
+                return;
+            } catch (err) {
+                console.error('Failed to send Agent Intercom message via Bridge:', err.message);
+                process.exitCode = 1;
+                return;
             }
         }
 
@@ -304,6 +339,7 @@ async function run() {
         ws.on('open', () => {
             ws.send(JSON.stringify({
                 action: 'register_listener',
+                agentRole: 'local',
                 keyword,
                 chat
             }));
@@ -313,6 +349,9 @@ async function run() {
             try {
                 const payload = JSON.parse(data);
                 if (payload.type === 'incoming_message') {
+                    if (payload.isAgentMessage && payload.toAgent && payload.toAgent !== 'all' && payload.toAgent !== 'local') {
+                        return;
+                    }
                     const bodyText = payload.body || '';
                     if (keyword && !bodyText.toLowerCase().includes(keyword)) {
                         return;
@@ -343,6 +382,48 @@ async function run() {
 
         ws.on('error', (err) => {
             console.error('Failed to connect to WhatsApp Engine. Is it running?', err.message);
+            process.exit(1);
+        });
+    } else if (command === 'agent-send') {
+        const toAgent = (process.argv[3] || 'cloud').toLowerCase();
+        const text = process.argv[4] || '';
+        const fromAgent = getFlagValue('--from') || 'local';
+        const requestId = 'ag_' + Date.now();
+
+        if (!text) {
+            console.error('Error: Missing message text for agent-send.');
+            process.exit(1);
+        }
+
+        const ws = new WebSocket(WS_URL);
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                action: 'agent_message',
+                requestId,
+                fromAgent,
+                toAgent,
+                text
+            }));
+        });
+
+        ws.on('message', (data) => {
+            try {
+                const payload = JSON.parse(data);
+                if (payload.type === 'agent_response' && payload.requestId === requestId) {
+                    console.log(`Agent Intercom message delivered (${fromAgent} -> ${toAgent}) [ID: ${payload.id}]`);
+                    ws.close();
+                    process.exit(0);
+                }
+            } catch (e) {}
+        });
+
+        setTimeout(() => {
+            ws.close();
+            process.exit(0);
+        }, 3000);
+
+        ws.on('error', (err) => {
+            console.error('Failed to connect to WhatsApp Engine:', err.message);
             process.exit(1);
         });
     } else if (command === 'send') {

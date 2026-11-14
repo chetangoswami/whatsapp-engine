@@ -129,6 +129,7 @@ app.get('/', (req, res) => {
                     <button onclick="setFilter('all')" id="filter-all" class="filter-btn active text-xs px-2 py-0.5 rounded border border-transparent transition">All</button>
                     <button onclick="setFilter('incoming')" id="filter-incoming" class="filter-btn text-xs text-[#8696a0] px-2 py-0.5 rounded border border-transparent transition">Incoming</button>
                     <button onclick="setFilter('outgoing')" id="filter-outgoing" class="filter-btn text-xs text-[#8696a0] px-2 py-0.5 rounded border border-transparent transition">Outgoing</button>
+                    <button onclick="setFilter('agent')" id="filter-agent" class="filter-btn text-xs text-[#a78bfa] px-2 py-0.5 rounded border border-transparent transition">Agents</button>
                 </div>
 
                 <!-- Search Input -->
@@ -231,7 +232,7 @@ app.get('/', (req, res) => {
 
         function setFilter(filter) {
             currentFilter = filter;
-            ['all', 'incoming', 'outgoing'].forEach(f => {
+            ['all', 'incoming', 'outgoing', 'agent'].forEach(f => {
                 const btn = document.getElementById('filter-' + f);
                 if (f === filter) {
                     btn.classList.add('active');
@@ -338,6 +339,15 @@ app.get('/', (req, res) => {
                         }
 
                         if (data.type === 'incoming_message') {
+                            if (data.isAgentMessage) {
+                                const fromA = (data.fromAgent || 'cloud').toUpperCase();
+                                const toA = (data.toAgent || 'local').toUpperCase();
+                                const sig = buildDedupKey(data.id, 'agent', fromA, data.body, new Date().toISOString());
+                                if (seenSignatures.has(sig)) return;
+                                seenSignatures.add(sig);
+                                logTerminal('🤖 [AGENT INTERCOM] ' + fromA + ' -> ' + toA + ': ' + data.body, 'log-highlight', 'agent');
+                                return;
+                            }
                             const sender = data.senderName || data.from;
                             const text = data.body || '(Media packet)';
                             const sig = buildDedupKey(data.id, 'incoming', sender, text, new Date().toISOString());
@@ -387,7 +397,9 @@ app.get('/', (req, res) => {
                         seenSignatures.add(sig);
 
                         const timeStr = log.time ? new Date(log.time).toLocaleTimeString() : null;
-                        if (log.type === 'incoming') {
+                        if (log.type === 'agent') {
+                            logTerminal('🤖 [AGENT INTERCOM] ' + (log.from || 'AGENT') + ' -> ' + (log.to || 'AGENT') + ': ' + text, 'log-highlight', 'agent', timeStr, forceScroll);
+                        } else if (log.type === 'incoming') {
                             logTerminal('[INCOMING] From ' + peer + ': ' + displayText, 'log-info', 'incoming', timeStr, forceScroll);
                         } else if (log.type === 'outgoing') {
                             logTerminal('[OUTGOING] To ' + peer + ': ' + text, 'log-success', 'outgoing', timeStr, forceScroll);

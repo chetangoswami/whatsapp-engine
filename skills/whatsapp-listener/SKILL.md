@@ -95,13 +95,29 @@ Use these synchronous CLI commands (`WaitMsBeforeAsync: 8000`) when the user ask
 
 ---
 
-## 4. Sending Messages & Safety Rules
+## 4. Sending WhatsApp Messages & Safety Rules
 
-- **Strict Safety Lock:** Only send messages when explicitly instructed by the user. Never send unsolicited or automated replies.
+- **Strict Safety Lock:** Only send WhatsApp messages when explicitly instructed by the user. Never send unsolicited or automated replies.
 - **Send Text, Quoted Reply, or Media Attachment:**
   ```bash
   node <ENGINE_DIR>/client.js send "<ChatID_or_ExactName>" "<MessageText>" [--replyTo "<MessageID>"] [--media "<AbsoluteFilePath>"]
   ```
 - Prefer passing the exact `ChatID` (e.g., `919876543210@c.us` or `1203630...@g.us`) over display names to avoid ambiguity.
+
+---
+
+## 5. Cloud ↔ Local Agent Intercom (`agent-send`)
+
+The Cloud Agent (on a remote VM) and the Local Agent (on the host PC) can communicate directly with each other in real time through the same Earpiece (`client.js listen`) and Live Dashboard (`http://localhost:8080/`):
+
+- **Cloud Agent → Local Agent** (wakes up the Local Agent's active Earpiece with `[AGENT INTERCOM MESSAGE RECEIVED]`):
+  ```bash
+  node <ENGINE_DIR>/client.js agent-send "local" "<MessageToLocalAgent>"
+  ```
+- **Local Agent → Cloud Agent** (wakes up the Cloud Agent's active `/api/poll` Earpiece with `[AGENT INTERCOM MESSAGE RECEIVED]`):
+  ```bash
+  node <ENGINE_DIR>/client.js agent-send "cloud" "<MessageToCloudAgent>"
+  ```
+- When awakened by an `[AGENT INTERCOM MESSAGE RECEIVED]` event, process the peer agent's request/update, reply via `agent-send` if needed, and immediately restart `node <ENGINE_DIR>/client.js listen` in the background.
 
 > For deep WebSocket & HTTPS Bridge JSON payload schemas, ACK queue internals, and troubleshooting steps, read [references/websocket-protocol.md](./references/websocket-protocol.md).
