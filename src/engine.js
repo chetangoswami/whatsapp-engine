@@ -87,6 +87,7 @@ const client = new Client({
 });
 
 let isReady = false;
+let qrPending = false;
 const wss = new WebSocket.Server({ port: PORT });
 const clients = new Set();
 const messageQueue = [];
@@ -122,6 +123,7 @@ function flushQueueForListener(ws) {
 console.log('[Engine] Starting WhatsApp client...');
 
 client.on('qr', (qr) => {
+    qrPending = true;
     console.log('[Engine] QR CODE REQUIRED! Scan this with your WhatsApp app:');
     qrcode.generate(qr, { small: true });
 
@@ -150,10 +152,12 @@ client.on('qr', (qr) => {
 });
 
 client.on('authenticated', () => {
+    qrPending = false;
     console.log('[Engine] Authenticated! (Wait for READY)');
 });
 
 client.on('auth_failure', msg => {
+    qrPending = false;
     console.error('[Engine] AUTHENTICATION FAILURE', msg);
 });
 
@@ -168,6 +172,7 @@ client.on('error', (error) => {
 
 client.on('ready', () => {
     isReady = true;
+    qrPending = false;
     console.log('[Engine] WhatsApp Client is READY and listening for messages!');
 
     try {
@@ -306,12 +311,23 @@ wss.on('connection', (ws) => {
             }
 
             if (parsed.action === 'status') {
+                const activeListeners = [];
+                clients.forEach(c => {
+                    if (c.readyState === WebSocket.OPEN && c.clientMeta?.role === 'listener') {
+                        activeListeners.push({
+                            keyword: c.clientMeta.keyword || null,
+                            chat: c.clientMeta.chat || null
+                        });
+                    }
+                });
                 ws.send(JSON.stringify({
                     type: 'status_response',
                     requestId: parsed.requestId,
                     ready: isReady,
+                    qrPending,
                     queuedMessages: messageQueue.length,
-                    connectedClients: clients.size
+                    connectedClients: clients.size,
+                    activeListeners
                 }));
                 return;
             }
