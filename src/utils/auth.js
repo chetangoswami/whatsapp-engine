@@ -292,7 +292,6 @@ async function discoverPrivateBridgeConfig() {
             if (m && m[1]) {
                 const owner = m[1].trim();
                 candidateRepos.add(`${owner}/${PRIVATE_BRIDGE_REPO}`);
-                candidateRepos.add(`${owner}/ikoho-theme`);
             }
         }
     } catch (e) {}
