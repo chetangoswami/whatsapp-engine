@@ -8,7 +8,7 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { ROOT_DIR, appendToChatLogs } = require('./utils/logger');
+const { ROOT_DIR, readChatLogs, appendToChatLogs } = require('./utils/logger');
 const { readLocalBridgeAuth, fetchGitHubUser } = require('./utils/auth');
 
 const PORT = Number(process.env.WHATSAPP_ENGINE_PORT || 8080);
@@ -484,6 +484,40 @@ async function checkBridgeAuth(req, res, next) {
 
 app.get('/api/health', (req, res) => {
     res.json({ ok: true, ready: isReady, qrPending });
+});
+
+// Local-only monitor routes on Port 8080 (blocked over public tunnel)
+function requireLocalLoopback(req, res, next) {
+    const isProxied = !!(req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']);
+    const remoteIp = req.socket?.remoteAddress || '';
+    const isLocalLoopback = !isProxied && (remoteIp === '127.0.0.1' || remoteIp === '::1' || remoteIp === '::ffff:127.0.0.1');
+    if (!isLocalLoopback) {
+        return res.status(403).send('Forbidden: Dashboard UI is restricted to localhost.');
+    }
+    next();
+}
+
+app.get('/api/qr', requireLocalLoopback, (req, res) => {
+    if (fs.existsSync(QR_PNG_PATH)) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.sendFile(QR_PNG_PATH);
+    } else {
+        res.status(404).json({ error: 'No QR code pending' });
+    }
+});
+
+app.get('/api/chat-logs', requireLocalLoopback, (req, res) => {
+    res.json(readChatLogs());
+});
+
+app.get('/', requireLocalLoopback, (req, res) => {
+    const dashFile = fs.readFileSync(path.join(__dirname, 'dashboard.js'), 'utf8');
+    const match = dashFile.match(/res\.send\(`([\s\S]*?)`\);/);
+    if (match) {
+        res.send(match[1]);
+    } else {
+        res.send('WhatsApp Engine Running on Port 8080');
+    }
 });
 
 // HTTP REST RPC Endpoint (Bypasses Cloud VM WebSocket Proxy Blocks)

@@ -145,6 +145,25 @@ async function run() {
                     }
                     const data = await res.json();
                     if (data && data.message) {
+                        // If the message has media and we are on a remote Cloud VM, auto-download it locally
+                        if (data.message.media && data.message.id) {
+                            try {
+                                const mediaRes = await callHttpRpc(baseUrl, {
+                                    action: 'fetch_media',
+                                    messageId: data.message.id
+                                });
+                                if (mediaRes && mediaRes.media && mediaRes.media.data) {
+                                    const localMediaDir = path.resolve(__dirname, '../media');
+                                    if (!fs.existsSync(localMediaDir)) {
+                                        fs.mkdirSync(localMediaDir, { recursive: true });
+                                    }
+                                    const filename = data.message.media.filename || `temp_${Date.now()}.bin`;
+                                    const localFilePath = path.join(localMediaDir, filename);
+                                    fs.writeFileSync(localFilePath, Buffer.from(mediaRes.media.data, 'base64'));
+                                    data.message.media.path = localFilePath;
+                                }
+                            } catch (e) {}
+                        }
                         printIncomingMessage(data.message);
                         await callHttpRpc(baseUrl, { action: 'ack_message', id: data.message.id });
                         if (!continuous) {

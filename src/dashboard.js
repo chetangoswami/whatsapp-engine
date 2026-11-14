@@ -293,12 +293,14 @@ app.get('/', (req, res) => {
 
             if (listeners.length > 0) {
                 const filters = listeners.map(l => {
-                    const parts = [];
+                    const mode = l.transport === 'http_poll' ? '[Cloud HTTPS]' : '[Local WS]';
+                    const parts = [mode];
                     if (l.keyword) parts.push('kw:' + l.keyword);
                     if (l.chat) parts.push('chat:' + l.chat);
-                    return parts.length ? parts.join(', ') : 'all messages';
+                    if (!l.keyword && !l.chat) parts.push('all');
+                    return parts.join(' ');
                 });
-                lisSub.textContent = 'Filter: ' + filters.join(' | ');
+                lisSub.textContent = filters.join(' | ');
                 lisSub.className = 'text-[11px] text-[#53bdeb] font-mono mt-0.5';
             } else {
                 lisSub.textContent = 'Idle (Messages buffered in queue)';
