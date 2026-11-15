@@ -449,6 +449,39 @@ async function executeAction(parsed) {
             return { type: 'send_response', requestId, ok: false, error: 'Engine not ready' };
         }
 
+        // Ensure WhatsApp Web's processMediaData does not leak internal __x_id: undefined
+        // properties onto outgoing message objects ("Data passed to getter must include an id property")
+        if (contentToSend instanceof MessageMedia && client.pupPage) {
+            try {
+                await client.pupPage.evaluate(() => {
+                    if (window.WWebJS && window.WWebJS.processMediaData && !window.WWebJS.__mediaDataPatched) {
+                        const origProcessMediaData = window.WWebJS.processMediaData;
+                        window.WWebJS.processMediaData = async function (...args) {
+                            const mediaData = await origProcessMediaData.apply(this, args);
+                            if (!mediaData) return mediaData;
+                            const raw = typeof mediaData.toJSON === 'function' ? mediaData.toJSON() : { ...mediaData };
+                            const clean = {};
+                            for (const [k, v] of Object.entries(raw)) {
+                                if (k !== 'id' && !k.startsWith('__x_')) {
+                                    clean[k] = v;
+                                }
+                            }
+                            if (mediaData.preview !== undefined && clean.preview === undefined) {
+                                clean.preview = mediaData.preview;
+                            }
+                            if (mediaData.mediaHandle !== undefined && clean.mediaHandle === undefined) {
+                                clean.mediaHandle = mediaData.mediaHandle;
+                            }
+                            return clean;
+                        };
+                        window.WWebJS.__mediaDataPatched = true;
+                    }
+                });
+            } catch (patchErr) {
+                console.error('[Engine] Warning: failed to patch processMediaData:', patchErr.message);
+            }
+        }
+
         if (to.includes('@c.us') || to.includes('@g.us') || to.includes('@lid')) {
             try {
                 let chat = null;
